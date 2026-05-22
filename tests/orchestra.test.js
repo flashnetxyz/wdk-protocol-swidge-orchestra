@@ -1,0 +1,769 @@
+import { beforeEach, describe, expect, jest, test } from '@jest/globals'
+import WDK from '@tetherto/wdk'
+import WalletManager from '@tetherto/wdk-wallet'
+import { SwapProtocol } from '@tetherto/wdk-wallet/protocols'
+
+import Orchestra, {
+  OrchestraClient,
+  OrchestraStateError,
+  OrchestraSubmitError
+} from '../index.js'
+
+const QUOTE = {
+  quoteId: 'quo_123',
+  depositAddress: 'sp1deposit',
+  amountIn: '1000',
+  estimatedOut: '990000',
+  feeAmount: '5',
+  totalFeeAmount: '10',
+  feeAsset: 'USDC',
+  route: ['BTC->USDB', 'USDB->USDC', 'USDC->USDT'],
+  expiresAt: '2099-01-01T00:00:00.000Z',
+  amountMode: 'exact_in'
+}
+
+const SUBMIT_CLIENT = {
+  orderId: 'ord_123',
+  status: 'processing',
+  readToken: 'read_client_token'
+}
+
+function jsonResponse (body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' }
+  })
+}
+
+function createFetch (responses) {
+  return jest.fn(async () => {
+    const next = responses.shift()
+    if (!next) throw new Error('unexpected fetch')
+    return jsonResponse(next.body, next.status ?? 200)
+  })
+}
+
+function readJsonBody (call) {
+  return JSON.parse(call[1].body)
+}
+
+class FakeWalletManager extends WalletManager {
+  constructor (seed, config) {
+    super(seed, config)
+    this.account = config.account
+  }
+
+  async getAccount () {
+    return this.account
+  }
+}
+
+describe('Orchestra', () => {
+  let account
+  let ids
+
+  beforeEach(() => {
+    account = {
+      getAddress: jest.fn().mockResolvedValue('sp1sender'),
+      sendTransaction: jest.fn().mockResolvedValue({ hash: 'spark_transfer_btc', fee: 0n }),
+      transfer: jest.fn().mockResolvedValue({ hash: 'spark_transfer_token', fee: 0n })
+    }
+    ids = ['quote-idem', 'submit-idem', 'extra-idem']
+  })
+
+  test('quoteSwap uses the side-effect-free estimate endpoint', async () => {
+    const fetch = createFetch([
+      { body: { estimatedOut: '990000', feeAmount: '10', feeBps: 100, feeAsset: 'USDC', route: 'BTC->USDT' } }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch,
+      sourceChain: 'spark'
+    })
+
+    const quote = await protocol.quoteSwap({
+      tokenIn: 'BTC',
+      tokenOut: 'tron:USDT',
+      tokenInAmount: 1000n,
+      to: 'TRecipient'
+    })
+
+    expect(quote).toEqual({
+      fee: 10n,
+      tokenInAmount: 1000n,
+      tokenOutAmount: 990000n
+    })
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(String(fetch.mock.calls[0][0])).toContain('/v1/orchestration/estimate?')
+    expect(String(fetch.mock.calls[0][0])).toContain('sourceChain=spark')
+    expect(String(fetch.mock.calls[0][0])).toContain('destinationChain=tron')
+    expect(fetch.mock.calls[0][1].headers.Authorization).toBe('Bearer fn_admin_key')
+  })
+
+  test('registers as a WDK swap protocol with the shared SwapProtocol identity', async () => {
+    const seed = WDK.getRandomSeedPhrase(12)
+    const wdk = new WDK(seed)
+      .registerWallet('spark', FakeWalletManager, { account })
+      .registerProtocol('spark', 'orchestra', Orchestra, { sourceChain: 'spark' })
+
+    const wdkAccount = await wdk.getAccount('spark', 0)
+    const protocol = wdkAccount.getSwapProtocol('orchestra')
+
+    expect(protocol).toBeInstanceOf(Orchestra)
+    expect(protocol).toBeInstanceOf(SwapProtocol)
+  })
+
+  test('prepareSwap creates a durable intent with quote and submit idempotency keys', async () => {
+    const fetch = createFetch([{ body: QUOTE }])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch,
+      idempotencyKeyFactory: () => ids.shift()
+    })
+
+    const intent = await protocol.prepareSwap({
+      source: { chain: 'spark', asset: 'BTC' },
+      destination: { chain: 'tron', asset: 'USDT', address: 'TRecipient' },
+      amount: 1000n
+    })
+
+    expect(intent).toMatchObject({
+      version: 1,
+      quoteId: 'quo_123',
+      sourceChain: 'spark',
+      sourceAsset: 'BTC',
+      destinationChain: 'tron',
+      destinationAsset: 'USDT',
+      depositAddress: 'sp1deposit',
+      amountIn: '1000',
+      estimatedOut: '990000',
+      quoteIdempotencyKey: 'quote-idem',
+      submitIdempotencyKey: 'submit-idem'
+    })
+    expect(fetch.mock.calls[0][1].headers['X-Idempotency-Key']).toBe('quote-idem')
+    expect(readJsonBody(fetch.mock.calls[0])).toMatchObject({
+      sourceChain: 'spark',
+      sourceAsset: 'BTC',
+      destinationChain: 'tron',
+      destinationAsset: 'USDT',
+      recipientAddress: 'TRecipient',
+      amount: '1000'
+    })
+  })
+
+  test('quoteSwap can route from Bitcoin L1', async () => {
+    const fetch = createFetch([
+      { body: { estimatedOut: '995', feeAmount: '5', feeBps: 50, feeAsset: 'BTC', route: 'bitcoin:BTC->spark:BTC' } }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch,
+      sourceChain: 'bitcoin'
+    })
+
+    await protocol.quoteSwap({
+      tokenIn: 'BTC',
+      tokenOut: 'spark:BTC',
+      tokenInAmount: 1000n,
+      to: 'sp1recipient'
+    })
+
+    expect(String(fetch.mock.calls[0][0])).toContain('sourceChain=bitcoin')
+    expect(String(fetch.mock.calls[0][0])).toContain('destinationChain=spark')
+  })
+
+  test('quoteSwap normalizes btc asset refs to Bitcoin L1', async () => {
+    const fetch = createFetch([
+      { body: { estimatedOut: '995', feeAmount: '5', feeBps: 50, feeAsset: 'BTC', route: 'bitcoin:BTC->spark:BTC' } }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch
+    })
+
+    await protocol.quoteSwap({
+      tokenIn: 'btc:BTC',
+      tokenOut: 'spark:BTC',
+      tokenInAmount: 1000n,
+      to: 'sp1recipient'
+    })
+
+    expect(String(fetch.mock.calls[0][0])).toContain('sourceChain=bitcoin')
+  })
+
+  test('executeSwapIntent sends Spark BTC and submits the transfer id', async () => {
+    const fetch = createFetch([
+      { body: QUOTE },
+      { body: SUBMIT_CLIENT }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      fetch,
+      idempotencyKeyFactory: () => ids.shift()
+    })
+    const intent = await protocol.prepareSwap({
+      tokenIn: 'spark:BTC',
+      tokenOut: 'tron:USDT',
+      tokenInAmount: 1000n,
+      to: 'TRecipient'
+    })
+
+    const state = await protocol.executeSwapIntent(intent)
+
+    expect(account.sendTransaction).toHaveBeenCalledWith({ to: 'sp1deposit', value: 1000n })
+    expect(readJsonBody(fetch.mock.calls[1])).toEqual({
+      quoteId: 'quo_123',
+      sparkTxHash: 'spark_transfer_btc',
+      sourceSparkAddress: 'sp1sender'
+    })
+    expect(fetch.mock.calls[1][1].headers['X-Idempotency-Key']).toBe('submit-idem')
+    expect(state).toMatchObject({
+      sourceTxHash: 'spark_transfer_btc',
+      orderId: 'ord_123',
+      readToken: 'read_client_token'
+    })
+  })
+
+  test('executeSwapIntent sends Bitcoin L1 BTC and submits the txid', async () => {
+    const bitcoinQuote = {
+      ...QUOTE,
+      depositAddress: 'bc1deposit',
+      route: 'bitcoin:BTC->spark:BTC'
+    }
+    const fetch = createFetch([
+      { body: bitcoinQuote },
+      { body: SUBMIT_CLIENT }
+    ])
+    const bitcoinAccount = {
+      getAddress: jest.fn().mockResolvedValue('bc1sender'),
+      sendTransaction: jest.fn().mockResolvedValue({ hash: 'l1_txid', fee: 123n })
+    }
+    const protocol = new Orchestra(bitcoinAccount, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'bitcoin',
+      idempotencyKeyFactory: () => ids.shift()
+    })
+
+    const intent = await protocol.prepareSwap({
+      tokenIn: 'BTC',
+      tokenOut: 'spark:BTC',
+      tokenInAmount: 1000n,
+      to: 'sp1recipient'
+    })
+    const state = await protocol.executeSwapIntent(intent, {
+      feeRate: 12n,
+      confirmationTarget: 2,
+      broadcastTimeoutMs: 5000
+    })
+
+    expect(bitcoinAccount.sendTransaction).toHaveBeenCalledWith({
+      to: 'bc1deposit',
+      value: 1000n,
+      feeRate: 12n,
+      confirmationTarget: 2
+    }, 5000)
+    expect(readJsonBody(fetch.mock.calls[1])).toEqual({
+      quoteId: 'quo_123',
+      bitcoinTxid: 'l1_txid',
+      sourceAddress: 'bc1sender'
+    })
+    expect(state).toMatchObject({
+      sourceTxHash: 'l1_txid',
+      sourceNetworkFee: '123',
+      sourceAddress: 'bc1sender',
+      orderId: 'ord_123'
+    })
+  })
+
+  test('executeSwapIntent retries Bitcoin submit while the tx propagates', async () => {
+    const bitcoinQuote = {
+      ...QUOTE,
+      depositAddress: 'bc1deposit',
+      route: ['bitcoin:BTC->spark:BTC']
+    }
+    const fetch = createFetch([
+      { body: bitcoinQuote },
+      { status: 400, body: { error: { code: 'tx_not_found', message: 'not propagated yet' } } },
+      { body: SUBMIT_CLIENT }
+    ])
+    const bitcoinAccount = {
+      getAddress: jest.fn().mockResolvedValue('bc1sender'),
+      sendTransaction: jest.fn().mockResolvedValue({ hash: 'l1_txid', fee: 123n })
+    }
+    const protocol = new Orchestra(bitcoinAccount, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'bitcoin',
+      submitRetryDelayMs: 1,
+      idempotencyKeyFactory: () => ids.shift()
+    })
+
+    const intent = await protocol.prepareSwap({
+      tokenIn: 'BTC',
+      tokenOut: 'spark:BTC',
+      tokenInAmount: 1000n,
+      to: 'sp1recipient'
+    })
+    const state = await protocol.executeSwapIntent(intent)
+
+    expect(fetch).toHaveBeenCalledTimes(3)
+    expect(readJsonBody(fetch.mock.calls[1])).toEqual(readJsonBody(fetch.mock.calls[2]))
+    expect(fetch.mock.calls[1][1].headers['X-Idempotency-Key']).toBe('submit-idem')
+    expect(fetch.mock.calls[2][1].headers['X-Idempotency-Key']).toBe('submit-idem')
+    expect(state.orderId).toBe('ord_123')
+  })
+
+  test('executeSwapIntent sends EVM tokens and submits the tx hash', async () => {
+    const evmQuote = {
+      ...QUOTE,
+      depositAddress: '0xDeposit',
+      amountIn: '2500000',
+      route: 'arbitrum:USDT->bitcoin:BTC'
+    }
+    const fetch = createFetch([
+      { body: evmQuote },
+      { body: SUBMIT_CLIENT }
+    ])
+    const evmAccount = {
+      getAddress: jest.fn().mockResolvedValue('0xSender'),
+      transfer: jest.fn().mockResolvedValue({ hash: '0xevmtx', fee: 12n })
+    }
+    const protocol = new Orchestra(evmAccount, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'arbitrum',
+      idempotencyKeyFactory: () => ids.shift()
+    })
+
+    const intent = await protocol.prepareSwap({
+      tokenIn: 'USDT',
+      tokenOut: 'bitcoin:BTC',
+      tokenInAmount: 2500000n,
+      to: 'bc1recipient'
+    })
+    const state = await protocol.executeSwapIntent(intent)
+
+    expect(evmAccount.transfer).toHaveBeenCalledWith({
+      token: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9',
+      recipient: '0xDeposit',
+      amount: 2500000n
+    })
+    expect(readJsonBody(fetch.mock.calls[1])).toEqual({
+      quoteId: 'quo_123',
+      txHash: '0xevmtx',
+      sourceAddress: '0xSender'
+    })
+    expect(state).toMatchObject({
+      sourceTxHash: '0xevmtx',
+      sourceNetworkFee: '12',
+      sourceAddress: '0xSender',
+      orderId: 'ord_123'
+    })
+  })
+
+  test('executeSwapIntent sends Spark tokens through transfer with configured token id', async () => {
+    const fetch = createFetch([
+      { body: { ...QUOTE, amountIn: '2500000' } },
+      { body: { orderId: 'ord_usdb', status: 'processing' } }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch,
+      sparkTokenIdentifiers: { USDB: 'btkn1usdb' },
+      sourceChain: 'spark',
+      idempotencyKeyFactory: () => ids.shift()
+    })
+    const intent = await protocol.prepareSwap({
+      tokenIn: 'USDB',
+      tokenOut: 'bitcoin:BTC',
+      tokenInAmount: 2500000n,
+      to: 'bc1recipient'
+    })
+
+    await protocol.executeSwapIntent(intent)
+
+    expect(account.transfer).toHaveBeenCalledWith({
+      token: 'btkn1usdb',
+      recipient: 'sp1deposit',
+      amount: 2500000n
+    })
+  })
+
+  test('client-key status follows orders with the read token header', async () => {
+    const fetch = createFetch([
+      { body: { order: { id: 'ord_123', status: 'processing' }, stages: [] } }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      fetch
+    })
+
+    await protocol.getOrderStatus({ orderId: 'ord_123', readToken: 'read_client_token' })
+
+    expect(String(fetch.mock.calls[0][0])).toContain('/v1/orchestration/status?id=ord_123')
+    expect(fetch.mock.calls[0][1].headers.Authorization).toBe('Bearer fn_client_key')
+    expect(fetch.mock.calls[0][1].headers['X-Read-Token']).toBe('read_client_token')
+  })
+
+  test('admin-key status does not require a read token', async () => {
+    const fetch = createFetch([
+      { body: { order: { id: 'ord_123', status: 'processing' }, stages: [] } }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch
+    })
+
+    await protocol.getOrderStatus({ orderId: 'ord_123' })
+
+    expect(fetch.mock.calls[0][1].headers.Authorization).toBe('Bearer fn_admin_key')
+    expect(fetch.mock.calls[0][1].headers['X-Read-Token']).toBeUndefined()
+  })
+
+  test('waitForCompletion polls until a terminal status', async () => {
+    const fetch = createFetch([
+      { body: { order: { id: 'ord_123', status: 'processing' }, stages: [] } },
+      { body: { order: { id: 'ord_123', status: 'completed' }, stages: [] } }
+    ])
+    const statuses = []
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch
+    })
+
+    const final = await protocol.waitForCompletion({ orderId: 'ord_123' }, {
+      pollIntervalMs: 1,
+      timeoutMs: 100,
+      onStatus: status => statuses.push(status.order.status)
+    })
+
+    expect(statuses).toEqual(['processing', 'completed'])
+    expect(final.order.status).toBe('completed')
+  })
+
+  test('resumeSwap submits an already-sent source transfer without sending again', async () => {
+    const fetch = createFetch([{ body: SUBMIT_CLIENT }])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      fetch
+    })
+
+    const state = await protocol.resumeSwap({
+      ...QUOTE,
+      version: 1,
+      sourceChain: 'spark',
+      sourceAsset: 'BTC',
+      destinationChain: 'tron',
+      destinationAsset: 'USDT',
+      recipientAddress: 'TRecipient',
+      quoteIdempotencyKey: 'quote-idem',
+      submitIdempotencyKey: 'submit-idem',
+      sourceTxHash: 'spark_transfer_existing',
+      createdAt: '2026-01-01T00:00:00.000Z'
+    })
+
+    expect(account.sendTransaction).not.toHaveBeenCalled()
+    expect(state.orderId).toBe('ord_123')
+    expect(readJsonBody(fetch.mock.calls[0]).sparkTxHash).toBe('spark_transfer_existing')
+  })
+
+  test('resumeSwap refuses to send a new source payment unless explicitly allowed', async () => {
+    const fetch = createFetch([])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'spark'
+    })
+
+    await expect(protocol.resumeSwap({
+      ...QUOTE,
+      version: 1,
+      sourceChain: 'spark',
+      sourceAsset: 'BTC',
+      destinationChain: 'tron',
+      destinationAsset: 'USDT',
+      recipientAddress: 'TRecipient',
+      quoteIdempotencyKey: 'quote-idem',
+      submitIdempotencyKey: 'submit-idem',
+      createdAt: '2026-01-01T00:00:00.000Z'
+    })).rejects.toBeInstanceOf(OrchestraStateError)
+
+    expect(account.sendTransaction).not.toHaveBeenCalled()
+  })
+
+  test('executeSwapIntent emits source_payment_started before broadcasting', async () => {
+    const fetch = createFetch([
+      { body: QUOTE },
+      { body: SUBMIT_CLIENT }
+    ])
+    const events = []
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'spark',
+      idempotencyKeyFactory: () => ids.shift(),
+      onStateChange: async (event, state) => {
+        events.push({ event, state })
+      }
+    })
+    const intent = await protocol.prepareSwap({
+      tokenIn: 'BTC',
+      tokenOut: 'tron:USDT',
+      tokenInAmount: 1000n,
+      to: 'TRecipient'
+    })
+
+    await protocol.executeSwapIntent(intent)
+
+    const started = events.find(item => item.event === 'source_payment_started')
+    expect(started.state.sourcePaymentStartedAt).toEqual(expect.any(String))
+    expect(account.sendTransaction).toHaveBeenCalledTimes(1)
+  })
+
+  test('executeSwapIntent emits JSON-safe source and submitted states', async () => {
+    const fetch = createFetch([
+      { body: QUOTE },
+      { body: SUBMIT_CLIENT }
+    ])
+    const events = []
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'spark',
+      idempotencyKeyFactory: () => ids.shift(),
+      onStateChange: async (event, state) => {
+        JSON.stringify(state)
+        events.push(event)
+      }
+    })
+    const intent = await protocol.prepareSwap({
+      tokenIn: 'BTC',
+      tokenOut: 'tron:USDT',
+      tokenInAmount: 1000n,
+      to: 'TRecipient'
+    })
+
+    const state = await protocol.executeSwapIntent(intent)
+
+    expect(state.sourceNetworkFee).toBe('0')
+    expect(events).toEqual([
+      'intent_created',
+      'source_payment_started',
+      'source_payment_sent',
+      'submitted'
+    ])
+  })
+
+  test('executeSwapIntent submits Spark source address captured before broadcast', async () => {
+    const fetch = createFetch([
+      { body: QUOTE },
+      { body: SUBMIT_CLIENT }
+    ])
+    const sparkAccount = {
+      getAddress: jest.fn()
+        .mockResolvedValueOnce('sp1sender')
+        .mockRejectedValue(new Error('address lookup should not be repeated')),
+      sendTransaction: jest.fn().mockResolvedValue({ hash: 'spark_transfer_btc', fee: 0n })
+    }
+    const protocol = new Orchestra(sparkAccount, {
+      apiKey: 'fn_client_key',
+      fetch,
+      idempotencyKeyFactory: () => ids.shift()
+    })
+    const intent = await protocol.prepareSwap({
+      tokenIn: 'spark:BTC',
+      tokenOut: 'tron:USDT',
+      tokenInAmount: 1000n,
+      to: 'TRecipient'
+    })
+
+    const state = await protocol.executeSwapIntent(intent)
+
+    expect(sparkAccount.getAddress).toHaveBeenCalledTimes(1)
+    expect(readJsonBody(fetch.mock.calls[1]).sourceSparkAddress).toBe('sp1sender')
+    expect(state.sourceAddress).toBe('sp1sender')
+  })
+
+  test('submitted state callback failures keep order recovery fields', async () => {
+    const fetch = createFetch([
+      { body: QUOTE },
+      { body: SUBMIT_CLIENT }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'spark',
+      idempotencyKeyFactory: () => ids.shift(),
+      onStateChange: async (event) => {
+        if (event === 'submitted') throw new Error('persistence unavailable')
+      }
+    })
+    const intent = await protocol.prepareSwap({
+      tokenIn: 'BTC',
+      tokenOut: 'tron:USDT',
+      tokenInAmount: 1000n,
+      to: 'TRecipient'
+    })
+
+    await expect(protocol.executeSwapIntent(intent)).rejects.toMatchObject({
+      name: 'OrchestraSubmitError',
+      state: {
+        sourceTxHash: 'spark_transfer_btc',
+        orderId: 'ord_123',
+        readToken: 'read_client_token'
+      }
+    })
+  })
+
+  test('executeSwapIntent rejects expired intents before moving funds', async () => {
+    const fetch = createFetch([])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'spark'
+    })
+
+    await expect(protocol.executeSwapIntent({
+      ...QUOTE,
+      version: 1,
+      sourceChain: 'spark',
+      sourceAsset: 'BTC',
+      destinationChain: 'tron',
+      destinationAsset: 'USDT',
+      recipientAddress: 'TRecipient',
+      expiresAt: '2000-01-01T00:00:00.000Z',
+      quoteIdempotencyKey: 'quote-idem',
+      submitIdempotencyKey: 'submit-idem',
+      createdAt: '2026-01-01T00:00:00.000Z'
+    })).rejects.toBeInstanceOf(OrchestraStateError)
+
+    expect(account.sendTransaction).not.toHaveBeenCalled()
+  })
+
+  test('resumeSwap submits an existing Bitcoin L1 tx without sending again', async () => {
+    const fetch = createFetch([{ body: SUBMIT_CLIENT }])
+    const bitcoinAccount = {
+      getAddress: jest.fn().mockResolvedValue('bc1sender'),
+      sendTransaction: jest.fn()
+    }
+    const protocol = new Orchestra(bitcoinAccount, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'bitcoin'
+    })
+
+    const state = await protocol.resumeSwap({
+      ...QUOTE,
+      version: 1,
+      sourceChain: 'bitcoin',
+      sourceAsset: 'BTC',
+      destinationChain: 'spark',
+      destinationAsset: 'BTC',
+      recipientAddress: 'sp1recipient',
+      depositAddress: 'bc1deposit',
+      quoteIdempotencyKey: 'quote-idem',
+      submitIdempotencyKey: 'submit-idem',
+      sourceTxHash: 'l1_existing_txid',
+      sourceAddress: 'bc1sender',
+      sourceTxVout: 1,
+      createdAt: '2026-01-01T00:00:00.000Z'
+    })
+
+    expect(bitcoinAccount.sendTransaction).not.toHaveBeenCalled()
+    expect(state.orderId).toBe('ord_123')
+    expect(readJsonBody(fetch.mock.calls[0])).toEqual({
+      quoteId: 'quo_123',
+      bitcoinTxid: 'l1_existing_txid',
+      sourceAddress: 'bc1sender',
+      bitcoinVout: 1
+    })
+    expect(state).toMatchObject({
+      sourceAddress: 'bc1sender',
+      sourceTxVout: 1
+    })
+  })
+
+  test('submit failure after source payment exposes resumable state', async () => {
+    const fetch = createFetch([
+      { body: QUOTE },
+      { status: 503, body: { error: { code: 'service_unavailable', message: 'temporary outage' } } }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch,
+      maxRetries: 0,
+      submitMaxRetries: 0,
+      sourceChain: 'spark',
+      idempotencyKeyFactory: () => ids.shift()
+    })
+    const intent = await protocol.prepareSwap({
+      tokenIn: 'BTC',
+      tokenOut: 'tron:USDT',
+      tokenInAmount: 1000n,
+      to: 'TRecipient'
+    })
+
+    try {
+      await protocol.executeSwapIntent(intent)
+      throw new Error('expected executeSwapIntent to fail')
+    } catch (err) {
+      expect(err).toBeInstanceOf(OrchestraSubmitError)
+      expect(err.state.sourceTxHash).toBe('spark_transfer_btc')
+    }
+  })
+
+  test('normalizes canonical asset aliases without uppercasing mixed-case symbols', async () => {
+    const fetch = createFetch([
+      { body: { estimatedOut: '995', totalFeeAmount: '5', route: ['polygon:USDC.e->bitcoin:BTC'] } }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch
+    })
+
+    await protocol.quoteSwap({
+      tokenIn: 'polygon:USDC.e',
+      tokenOut: 'bitcoin:BTC',
+      tokenInAmount: '1000',
+      to: 'bc1recipient'
+    })
+
+    expect(String(fetch.mock.calls[0][0])).toContain('sourceAsset=USDC.e')
+  })
+})
+
+describe('OrchestraClient', () => {
+  test('adds idempotency keys to direct mutating calls', async () => {
+    const fetch = createFetch([
+      { body: QUOTE },
+      { body: SUBMIT_CLIENT }
+    ])
+    const client = new OrchestraClient({
+      apiKey: 'fn_admin_key',
+      fetch
+    })
+
+    await client.createQuote({ sourceChain: 'spark' })
+    await client.submit({ quoteId: 'quo_123', sparkTxHash: 'spark_tx' })
+
+    expect(fetch.mock.calls[0][1].headers['X-Idempotency-Key']).toMatch(/^orchestra-|^[0-9a-f-]{36}$/)
+    expect(fetch.mock.calls[1][1].headers['X-Idempotency-Key']).toMatch(/^orchestra-|^[0-9a-f-]{36}$/)
+  })
+
+  test('does not use apiKey as an SSE URL token unless client auth is explicit', async () => {
+    const fetch = jest.fn()
+    const defaultClient = new OrchestraClient({
+      apiKey: 'fn_admin_key',
+      fetch
+    })
+    const scopedClient = new OrchestraClient({
+      apiKey: 'client_key_for_test',
+      authMode: 'client',
+      fetch
+    })
+
+    await expect(defaultClient._resolveSseToken()).rejects.toMatchObject({ code: 'sse_token_required' })
+    await expect(scopedClient._resolveSseToken()).resolves.toBe('client_key_for_test')
+  })
+})
