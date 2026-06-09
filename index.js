@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/** @typedef {import('@tetherto/wdk-wallet/protocols').SwapOptions} SwapOptions */
-
-/** @typedef {import('@tetherto/wdk-wallet/protocols').SwapResult} SwapResult */
+/** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeOptions} SwidgeOptions */
+/** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeResult} SwidgeResult */
 
 /** @typedef {import('./src/orchestra.js').OrchestraConfig} OrchestraConfig */
 /** @typedef {import('./src/orchestra.js').OrchestraSwapIntent} OrchestraSwapIntent */

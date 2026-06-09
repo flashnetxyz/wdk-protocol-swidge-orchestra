@@ -38,6 +38,7 @@ export function isTerminalOrderStatus(status: string): boolean
 export class OrchestraClient {
   constructor(config?: OrchestraClientConfig)
   estimate<T extends object = Record<string, unknown>>(params: object): Promise<T>
+  getRoutes<T extends object = Record<string, unknown>>(): Promise<T>
   createQuote<T extends object = Record<string, unknown>>(
     params: object,
     options?: RequestOptions

@@ -171,9 +171,7 @@ function directionConfig (name) {
   return config
 }
 
-function makeWdk (env, onStateChange) {
-  const baseUrl = env.ORCHESTRA_BASE_URL || DEFAULT_BASE_URL
-  const apiKey = env.FLASHNET_API_KEY || undefined
+function makeWdk (env) {
   const electrumHost = env.BITCOIN_ELECTRUM_HOST || 'electrum.blockstream.info'
   const electrumPort = Number(env.BITCOIN_ELECTRUM_PORT || '50001')
   const bitcoinWalletConfig = {
@@ -195,31 +193,10 @@ function makeWdk (env, onStateChange) {
       syncAndRetry: true
     })
     .registerWallet('arbitrum', WalletManagerEvm, arbitrumWalletConfig)
-    .registerProtocol('bitcoin', 'orchestra', Orchestra, {
-      sourceChain: 'bitcoin',
-      apiKey,
-      baseUrl,
-      onStateChange
-    })
-    .registerProtocol('arbitrum', 'orchestra', Orchestra, {
-      sourceChain: 'arbitrum',
-      apiKey,
-      baseUrl,
-      onStateChange,
-      sourceTokenAddresses: {
-        'arbitrum:USDT': env.ARBITRUM_USDT_ADDRESS || ARBITRUM_USDT
-      }
-    })
-    .registerProtocol('spark', 'orchestra', Orchestra, {
-      sourceChain: 'spark',
-      apiKey,
-      baseUrl,
-      onStateChange
-    })
 }
 
-async function accounts (env, onStateChange) {
-  const wdk = makeWdk(env, onStateChange)
+async function accounts (env) {
+  const wdk = makeWdk(env)
   const [bitcoin, spark, arbitrum] = await Promise.all([
     wdk.getAccount('bitcoin', 0),
     wdk.getAccount('spark', 0),
@@ -228,19 +205,35 @@ async function accounts (env, onStateChange) {
   return { wdk, bitcoin, spark, arbitrum }
 }
 
+function protocolConfig (env, sourceChain, onStateChange) {
+  return {
+    sourceChain,
+    apiKey: env.FLASHNET_API_KEY || undefined,
+    baseUrl: env.ORCHESTRA_BASE_URL || DEFAULT_BASE_URL,
+    onStateChange,
+    ...(sourceChain === 'arbitrum'
+      ? {
+          sourceTokenAddresses: {
+            'arbitrum:USDT': env.ARBITRUM_USDT_ADDRESS || ARBITRUM_USDT
+          }
+        }
+      : {})
+  }
+}
+
 async function swapContext (env, directionName, onStateChange, recipientAddress) {
   const direction = directionConfig(directionName)
-  const wdk = makeWdk(env, onStateChange)
+  const wdk = makeWdk(env)
   const sourceAccount = await wdk.getAccount(direction.sourceWallet, 0)
   const destinationAddress = recipientAddress ?? await (await wdk.getAccount(direction.destinationWallet, 0)).getAddress()
   return {
     wdk,
-    protocol: sourceAccount.getSwapProtocol('orchestra'),
+    protocol: new Orchestra(sourceAccount, protocolConfig(env, direction.sourceChain, onStateChange)),
     direction,
     options: {
-      tokenIn: `${direction.sourceChain}:${direction.sourceAsset}`,
-      tokenOut: `${direction.destinationChain}:${direction.destinationAsset}`,
-      to: destinationAddress
+      fromToken: `${direction.sourceChain}:${direction.sourceAsset}`,
+      toToken: `${direction.destinationChain}:${direction.destinationAsset}`,
+      recipient: destinationAddress
     }
   }
 }
@@ -309,9 +302,9 @@ async function quote (args) {
   await preflightRoute(env, directionConfig(directionName))
   const context = await swapContext(env, directionName, undefined, args.to ? String(args.to) : undefined)
   try {
-    const result = await context.protocol.quoteSwap({
+    const result = await context.protocol.quoteSwidge({
       ...context.options,
-      tokenInAmount: BigInt(amount)
+      fromTokenAmount: BigInt(amount)
     })
     writeJson({ direction: directionName, amount, amountUnit: context.direction.amountLabel, quote: result })
   } finally {
@@ -329,7 +322,7 @@ async function prepare (args) {
   try {
     const intent = await context.protocol.prepareSwap({
       ...context.options,
-      tokenInAmount: BigInt(amount)
+      fromTokenAmount: BigInt(amount)
     })
     const file = String(args.out || stateFileFor(directionName))
     writeState(file, intent)

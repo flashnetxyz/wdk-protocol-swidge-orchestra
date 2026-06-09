@@ -1,42 +1,56 @@
 # @flashnet/orchestra-wdk
 
-`@flashnet/orchestra-wdk` is a WDK swap protocol for moving between BTC on Spark, Bitcoin L1, or Lightning and USDT (+ other assets) on Arbitrum, BSC, Ethereum, Optimism, Plasma, Polygon, Solana, TON, and Tron.
+![Powered by WDK](https://img.shields.io/badge/Powered%20by-WDK-111111)
 
-It lets a WDK wallet quote, fund, submit, and track Orchestra swaps from the wallet account that already holds the user's funds. WDK owns keys and transaction signing. Orchestra owns quote and order state. The host app owns local persistence.
+`@flashnet/orchestra-wdk` is a WDK `SwidgeProtocol` for moving between BTC on Spark, Bitcoin L1, or Lightning and USDT on Ethereum, Tron, Arbitrum, Solana, BSC, Optimism, Plasma, Polygon, TON, and every route returned by Orchestra.
+
+WDK owns wallet accounts, key material, and transaction signing. Orchestra owns quote routing, deposit addresses, order state, and settlement. The host wallet owns durable local or backend persistence.
 
 ```
 WDK account -> Orchestra protocol -> Flashnet Orchestra API
      |                  |                    |
      | signs payment    | submits tx id      | routes and settles order
      |                  |                    |
-     +---- app persists serializable intent -+
+     +---- app persists serializable state --+
 ```
 
-The package is intentionally small. It does not run a database, store keys, poll chains directly, or hide state transitions from the app.
+The package does not run a database, custody keys, poll chains directly, or hide money-moving state transitions from the app.
 
 ## USDT Route Coverage
 
-The live route matrix is available at [`/v1/orchestration/routes`](https://orchestration.flashnet.xyz/v1/orchestration/routes). Use it at runtime to decide what to show in a wallet UI.
+Use the live route matrix as the source of truth:
 
-Current USDT coverage for BTC routes against Ethereum, Tron, Arbitrum, Solana, BSC, Optimism, Plasma, Polygon, TON and many more.
+[`GET /v1/orchestration/routes`](https://orchestration.flashnet.xyz/v1/orchestration/routes)
 
-Example route strings:
+Representative BTC and USDT routes:
 
 ```javascript
-const routeExamples = [
+const routes = [
   "spark:BTC -> tron:USDT",
-  "bitcoin:BTC -> ton:USDT",
-  "lightning:BTC -> ethereum:USDT",
+  "bitcoin:BTC -> ethereum:USDT",
+  "lightning:BTC -> arbitrum:USDT",
   "bsc:USDT -> spark:BTC",
   "solana:USDT -> lightning:BTC",
-  "polygon:USDT -> bitcoin:BTC",
-];
+  "polygon:USDT -> bitcoin:BTC"
+]
 ```
+
+The package also exposes WDK discovery methods:
+
+```javascript
+const chains = await orchestra.getSupportedChains()
+const tokens = await orchestra.getSupportedTokens({
+  fromChain: "spark",
+  toChain: "tron"
+})
+```
+
+Use discovery for wallet UI. Use the route matrix when you need the exact source and destination pairs Orchestra can execute at that moment.
 
 ## Install
 
 ```bash
-npm install @flashnet/orchestra-wdk @tetherto/wdk-wallet
+npm install @flashnet/orchestra-wdk @tetherto/wdk-wallet@1.0.0-beta.9
 ```
 
 Install the WDK wallet packages for the chains you support:
@@ -45,55 +59,37 @@ Install the WDK wallet packages for the chains you support:
 npm install @tetherto/wdk @tetherto/wdk-wallet-spark @tetherto/wdk-wallet-btc @tetherto/wdk-wallet-evm
 ```
 
-## Supported Flow Shape
+## WDK Interface
 
-Use the split flow in production:
+`Orchestra` extends `SwidgeProtocol` from `@tetherto/wdk-wallet@1.0.0-beta.9`.
 
-1. Quote and reserve a deposit address with `prepareSwap()`.
-2. Persist the returned intent before moving funds.
-3. Execute the source payment with `executeSwapIntent()`.
-4. Persist the submitted state.
-5. Track the order with `waitForCompletion()`, `getOrderStatus()`, or SSE.
+Implemented methods:
 
-`saveSwap` and `saveOrderStatus` in these examples are placeholders for your app's durable storage. This package does not export them. Implement them with your own database, encrypted local storage, or backend API before wiring the flow to real funds.
+- `quoteSwidge(options)`
+- `swidge(options, config?)`
+- `getSwidgeStatus(id, options?)`
+- `getSupportedChains()`
+- `getSupportedTokens(options?)`
 
-```javascript
-const intent = await orchestra.prepareSwap({
-  tokenIn: "spark:BTC",
-  tokenOut: "tron:USDT",
-  tokenInAmount: 7116n,
-  to: "TRecipient...",
-});
+WDK's `SwidgeProtocol` base class delegates `quoteSwap`, `swap`, `quoteBridge`, and `bridge` to `quoteSwidge` and `swidge`. This package does not override those methods.
 
-await saveSwap(intent);
+Current WDK beta note: the protocol class conforms to `SwidgeProtocol`. If the WDK manager in your app has not yet added Swidge registration helpers, construct the protocol from the source account directly as shown below.
 
-const submitted = await orchestra.executeSwapIntent(intent);
-await saveSwap(submitted);
+## Create A Protocol
 
-const finalStatus = await orchestra.waitForCompletion(submitted, {
-  onStatus: async (status) => {
-    await saveOrderStatus(status);
-  },
-});
-```
-
-`swap()` exists for WDK surfaces that expect a one-call swap method, but it is disabled by default. Pass `allowOneShot: true` only for local tests or tightly controlled flows where losing the process after broadcast is acceptable.
-
-## Register With WDK
-
-Register one Orchestra protocol per source wallet. Set `sourceChain` explicitly. WDK constructs protocols as `new Protocol(account, config)` and does not pass the registered blockchain label to the protocol constructor.
+Create one Orchestra instance per source wallet account. Set `sourceChain` explicitly because WDK accounts do not always expose a canonical chain id to protocol constructors.
 
 ```javascript
-import WDK from "@tetherto/wdk";
-import WalletManagerBtc from "@tetherto/wdk-wallet-btc";
-import WalletManagerEvm from "@tetherto/wdk-wallet-evm";
-import WalletManagerSpark from "@tetherto/wdk-wallet-spark";
-import Orchestra from "@flashnet/orchestra-wdk";
+import WDK from "@tetherto/wdk"
+import WalletManagerBtc from "@tetherto/wdk-wallet-btc"
+import WalletManagerEvm from "@tetherto/wdk-wallet-evm"
+import WalletManagerSpark from "@tetherto/wdk-wallet-spark"
+import Orchestra from "@flashnet/orchestra-wdk"
 
 const wdk = new WDK(seedPhrase)
   .registerWallet("spark", WalletManagerSpark, {
     network: "MAINNET",
-    syncAndRetry: true,
+    syncAndRetry: true
   })
   .registerWallet("bitcoin", WalletManagerBtc, {
     network: "bitcoin",
@@ -101,106 +97,152 @@ const wdk = new WDK(seedPhrase)
       type: "electrum",
       clientConfig: {
         host: "electrum.blockstream.info",
-        port: 50001,
-      },
-    },
+        port: 50001
+      }
+    }
   })
   .registerWallet("arbitrum", WalletManagerEvm, {
     chainId: 42161,
-    provider: process.env.ARBITRUM_RPC_URL,
+    provider: process.env.ARBITRUM_RPC_URL
   })
-  .registerWallet("bsc", WalletManagerEvm, {
-    chainId: 56,
-    provider: process.env.BSC_RPC_URL,
-  })
-  .registerProtocol("spark", "orchestra", Orchestra, {
-    sourceChain: "spark",
-    apiKey: process.env.FLASHNET_API_KEY,
-    baseUrl: "https://orchestration.flashnet.xyz",
-  })
-  .registerProtocol("bitcoin", "orchestra", Orchestra, {
-    sourceChain: "bitcoin",
-    apiKey: process.env.FLASHNET_API_KEY,
-    baseUrl: "https://orchestration.flashnet.xyz",
-  })
-  .registerProtocol("arbitrum", "orchestra", Orchestra, {
-    sourceChain: "arbitrum",
-    apiKey: process.env.FLASHNET_API_KEY,
-    baseUrl: "https://orchestration.flashnet.xyz",
-    sourceTokenAddresses: {
-      "arbitrum:USDT": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
-    },
-  })
-  .registerProtocol("bsc", "orchestra", Orchestra, {
-    sourceChain: "bsc",
-    apiKey: process.env.FLASHNET_API_KEY,
-    baseUrl: "https://orchestration.flashnet.xyz",
-    sourceTokenAddresses: {
-      "bsc:USDT": "0x55d398326f99059ff775485246999027b3197955",
-    },
-  });
+
+const spark = await wdk.getAccount("spark", 0)
+
+const orchestra = new Orchestra(spark, {
+  sourceChain: "spark",
+  apiKey: process.env.FLASHNET_API_KEY,
+  baseUrl: "https://orchestration.flashnet.xyz"
+})
 ```
 
-Get the protocol from the source account:
+EVM token sources need token contract addresses. Common USDT source addresses are built in, but production wallets should pass their own allowlist.
 
 ```javascript
-const spark = await wdk.getAccount("spark", 0);
-const orchestra = spark.getSwapProtocol("orchestra");
+const arbitrum = await wdk.getAccount("arbitrum", 0)
+
+const orchestra = new Orchestra(arbitrum, {
+  sourceChain: "arbitrum",
+  apiKey: process.env.FLASHNET_API_KEY,
+  sourceTokenAddresses: {
+    "arbitrum:USDT": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"
+  }
+})
 ```
 
-## Quote Without Side Effects
+## Quote
 
-`quoteSwap()` calls Orchestra estimate. It does not reserve a deposit address and does not move funds.
+`quoteSwidge()` is side-effect-free. It calls Orchestra's estimate endpoint and does not reserve a deposit address.
 
 ```javascript
-const quote = await orchestra.quoteSwap({
-  tokenIn: "spark:BTC",
-  tokenOut: "tron:USDT",
-  tokenInAmount: 7116n,
-  to: "TRecipient...",
-});
+const quote = await orchestra.quoteSwidge({
+  fromToken: "spark:BTC",
+  toToken: "tron:USDT",
+  fromTokenAmount: 7116n,
+  recipient: "TRecipient...",
+  slippage: 0.01
+})
 
-console.log(quote.tokenInAmount); // 7116n
-console.log(quote.tokenOutAmount); // quoted USDT smallest units
-console.log(quote.fee); // fee smallest units for the route fee asset
+console.log(quote.fromTokenAmount)
+console.log(quote.toTokenAmount)
+console.log(quote.toTokenAmountMin)
+console.log(quote.fees)
 ```
 
-Use smallest units everywhere:
+Use smallest units:
 
-| Asset         | Unit                  |
-| ------------- | --------------------- |
-| BTC           | sats                  |
-| USDT          | 6-decimal token units |
-| EVM gas asset | wei                   |
+| Asset | Unit |
+| --- | --- |
+| BTC | sats |
+| USDT | 6-decimal token units |
+| EVM gas asset | wei |
+
+## Execute With WDK Swidge
+
+`swidge()` creates an Orchestra quote, sends the source payment from the WDK account, submits the transaction id to Orchestra, and returns the Orchestra order id.
+
+```javascript
+const result = await orchestra.swidge({
+  fromToken: "spark:BTC",
+  toToken: "tron:USDT",
+  fromTokenAmount: 7116n,
+  recipient: "TRecipient..."
+}, {
+  maxNetworkFeeBps: 20n,
+  maxProtocolFeeBps: 100n
+})
+
+console.log(result.id)
+console.log(result.hash)
+console.log(result.transactions)
+```
+
+Use this one-call path only when the host app has its own crash recovery around the call. Wallet production flows should use the explicit persistence boundary below.
+
+## Production Flow
+
+Use `prepareSwap()` and `executeSwapIntent()` when funds are at risk. The split flow gives the host wallet a durable point between quote creation and source payment.
+
+1. `prepareSwap()` creates an Orchestra quote and reserves a deposit address.
+2. The app persists the returned intent.
+3. `executeSwapIntent()` sends the source payment and submits the transfer id.
+4. The app persists the submitted state.
+5. The app tracks the order with `getOrderStatus()`, `getSwidgeStatus()`, `waitForCompletion()`, or SSE.
+
+`saveSwap` and `saveOrderStatus` are not exported by this package. They are placeholders for your implementation. Back them with your own database, encrypted local storage, or backend API before moving real funds.
+
+```javascript
+const intent = await orchestra.prepareSwap({
+  fromToken: "spark:BTC",
+  toToken: "tron:USDT",
+  fromTokenAmount: 7116n,
+  recipient: "TRecipient..."
+})
+
+await saveSwap(intent)
+
+const submitted = await orchestra.executeSwapIntent(intent)
+await saveSwap(submitted)
+
+const finalStatus = await orchestra.waitForCompletion(submitted, {
+  onStatus: async (status) => {
+    await saveOrderStatus(status)
+  }
+})
+```
+
+Persist the full object returned by every state transition. Do not store only the order id. Recovery may need the quote id, deposit address, source tx hash, read token, source chain, and submit idempotency key.
 
 ## Spark BTC To USDT
 
-This is the standard Spark sell flow. Spark signs the BTC transfer, Orchestra swaps through its route, and the destination chain receives USDT.
+Spark signs the BTC transfer. Orchestra settles USDT on the destination chain.
 
 ```javascript
-const spark = await wdk.getAccount("spark", 0);
-const orchestra = spark.getSwapProtocol("orchestra");
+const spark = await wdk.getAccount("spark", 0)
+const orchestra = new Orchestra(spark, {
+  sourceChain: "spark",
+  apiKey
+})
 
 const intent = await orchestra.prepareSwap({
-  tokenIn: "spark:BTC",
-  tokenOut: "tron:USDT",
-  tokenInAmount: 7116n,
-  to: "TRecipient...",
-});
+  fromToken: "spark:BTC",
+  toToken: "tron:USDT",
+  fromTokenAmount: 7116n,
+  recipient: "TRecipient..."
+})
 
-await saveSwap(intent);
+await saveSwap(intent)
 
-const submitted = await orchestra.executeSwapIntent(intent);
-await saveSwap(submitted);
+const submitted = await orchestra.executeSwapIntent(intent)
+await saveSwap(submitted)
 ```
 
-The submitted state includes the Spark source transfer id, the source wallet's network fee, the Orchestra order id, and a read token when using a scoped client key. `sourceNetworkFee` is reported by WDK when the source payment is sent. Orchestra quote fees remain in `feeAmount`, `totalFeeAmount`, and `feeAsset`.
+The submitted state includes the Spark source transfer id, source wallet network fee, Orchestra order id, and read token when using a scoped client key.
 
 ```javascript
-console.log(submitted.sourceTxHash);
-console.log(submitted.sourceNetworkFee);
-console.log(submitted.orderId);
-console.log(submitted.readToken);
+console.log(submitted.sourceTxHash)
+console.log(submitted.sourceNetworkFee)
+console.log(submitted.orderId)
+console.log(submitted.readToken)
 ```
 
 ## USDT To Spark BTC
@@ -208,24 +250,24 @@ console.log(submitted.readToken);
 EVM token sources use WDK `transfer({ token, recipient, amount })`. The source account needs native gas for its chain.
 
 ```javascript
-const bsc = await wdk.getAccount("bsc", 0);
-const spark = await wdk.getAccount("spark", 0);
-const orchestra = bsc.getSwapProtocol("orchestra");
+const bsc = await wdk.getAccount("bsc", 0)
+const spark = await wdk.getAccount("spark", 0)
+
+const orchestra = new Orchestra(bsc, {
+  sourceChain: "bsc",
+  apiKey,
+  sourceTokenAddresses: {
+    "bsc:USDT": "0x55d398326f99059ff775485246999027b3197955"
+  }
+})
 
 const intent = await orchestra.prepareSwap({
-  tokenIn: "bsc:USDT",
-  tokenOut: "spark:BTC",
-  tokenInAmount: 5466162n,
-  to: await spark.getAddress(),
-});
-
-await saveSwap(intent);
-
-const submitted = await orchestra.executeSwapIntent(intent);
-await saveSwap(submitted);
+  fromToken: "bsc:USDT",
+  toToken: "spark:BTC",
+  fromTokenAmount: 5_000_000n,
+  recipient: await spark.getAddress()
+})
 ```
-
-Default source token addresses are built in for common USDT routes. Production apps should still pass their own allowlist.
 
 ## Bitcoin L1
 
@@ -234,147 +276,169 @@ Bitcoin L1 can be the source or destination.
 ### L1 BTC Source
 
 ```javascript
-const bitcoin = await wdk.getAccount("bitcoin", 0);
-const spark = await wdk.getAccount("spark", 0);
-const orchestra = bitcoin.getSwapProtocol("orchestra");
+const bitcoin = await wdk.getAccount("bitcoin", 0)
+const spark = await wdk.getAccount("spark", 0)
+
+const orchestra = new Orchestra(bitcoin, {
+  sourceChain: "bitcoin",
+  apiKey
+})
 
 const intent = await orchestra.prepareSwap({
-  tokenIn: "bitcoin:BTC",
-  tokenOut: "spark:BTC",
-  tokenInAmount: 100000n,
-  to: await spark.getAddress(),
-});
+  fromToken: "bitcoin:BTC",
+  toToken: "spark:BTC",
+  fromTokenAmount: 100000n,
+  recipient: await spark.getAddress()
+})
 
-await saveSwap(intent);
+await saveSwap(intent)
 
 const submitted = await orchestra.executeSwapIntent(intent, {
   feeRate: 12n,
-  confirmationTarget: 2,
-});
+  confirmationTarget: 2
+})
 ```
 
-For Bitcoin sources, the package submits `bitcoinTxid` to Orchestra. It retries `tx_not_found` and `vout_not_found` submit responses with the same idempotency key because a freshly broadcast Bitcoin transaction may need time to propagate.
+For Bitcoin sources, the package submits `bitcoinTxid` to Orchestra. It retries `tx_not_found` and `vout_not_found` submit responses with the same idempotency key because a newly broadcast Bitcoin transaction may need time to propagate.
 
 ### L1 BTC Destination
 
 ```javascript
-const spark = await wdk.getAccount("spark", 0);
-const bitcoin = await wdk.getAccount("bitcoin", 0);
-const orchestra = spark.getSwapProtocol("orchestra");
+const spark = await wdk.getAccount("spark", 0)
+const bitcoin = await wdk.getAccount("bitcoin", 0)
+
+const orchestra = new Orchestra(spark, {
+  sourceChain: "spark",
+  apiKey
+})
 
 const intent = await orchestra.prepareSwap({
-  tokenIn: "spark:BTC",
-  tokenOut: "bitcoin:BTC",
-  tokenInAmount: 100000n,
-  to: await bitcoin.getAddress(),
-});
+  fromToken: "spark:BTC",
+  toToken: "bitcoin:BTC",
+  fromTokenAmount: 100000n,
+  recipient: await bitcoin.getAddress()
+})
 ```
 
-Pass `to` for cross-account routes. A protocol registered on a Spark account cannot infer the user's Bitcoin receive address.
+Pass `recipient` for cross-account routes. A protocol constructed on a Spark account cannot infer the user's Bitcoin receive address.
 
 ## Lightning
 
-Orchestra route support includes `bsc:USDT -> lightning:BTC`, `solana:USDT -> lightning:BTC`, and other USDT-to-Lightning routes. A wallet can pay a BOLT11 invoice or Lightning Address using USDT from a supported chain.
+Orchestra supports USDT-to-Lightning routes such as `bsc:USDT -> lightning:BTC` and `solana:USDT -> lightning:BTC`. A wallet can pay a BOLT11 invoice or Lightning Address using USDT from a supported chain.
 
 ```javascript
-const bsc = await wdk.getAccount("bsc", 0);
-const orchestra = bsc.getSwapProtocol("orchestra");
+const bsc = await wdk.getAccount("bsc", 0)
+
+const orchestra = new Orchestra(bsc, {
+  sourceChain: "bsc",
+  apiKey
+})
 
 const intent = await orchestra.prepareSwap({
-  tokenIn: "bsc:USDT",
-  tokenOut: "lightning:BTC",
-  tokenInAmount: 5000000n,
-  to: bolt11Invoice,
+  fromToken: "bsc:USDT",
+  toToken: "lightning:BTC",
+  fromTokenAmount: 5_000_000n,
+  recipient: bolt11Invoice,
   refundChain: "bsc",
-  refundAddress: await bsc.getAddress(),
-});
+  refundAddress: await bsc.getAddress()
+})
 ```
 
-Current API behavior: Orchestra asks for `refundAddress` on Lightning destinations even though the payment flow does not inherently need one. The package only forwards `refundChain` and `refundAddress`; it does not enforce this rule locally. If the Orchestra API removes the requirement, no package API change is needed.
+Current API behavior: Orchestra asks for `refundAddress` on Lightning destinations. The package forwards `refundChain` and `refundAddress`; it does not enforce the rule locally. If Orchestra removes that API requirement, this package does not need a public API change.
 
-Lightning source routes, such as `lightning:BTC -> tron:USDT`, are also present. That flow is different from a WDK account send. The user pays an Orchestra Lightning receive invoice, and the app submits the receive request id rather than broadcasting from a WDK wallet account.
+Lightning source routes, such as `lightning:BTC -> tron:USDT`, are also present in the route matrix. A Lightning source is not a WDK account send. The user pays an Orchestra Lightning receive invoice, then the app submits the receive request id to Orchestra.
 
 ## Auth
 
-The package supports backend keys and scoped client keys through `apiKey`.
+The package supports backend keys and scoped client keys.
+
+Backend key:
 
 ```javascript
-new Orchestra(account, {
+const orchestra = new Orchestra(account, {
+  sourceChain: "spark",
   apiKey: process.env.FLASHNET_API_KEY,
-  baseUrl: "https://orchestration.flashnet.xyz",
-});
+  baseUrl: "https://orchestration.flashnet.xyz"
+})
 ```
 
-Scoped client keys receive a `readToken` from `/submit`. The package stores it on the submitted state and uses it for status requests.
+Scoped client key:
 
 ```javascript
-const submitted = await orchestra.executeSwapIntent(intent);
+const orchestra = new Orchestra(account, {
+  sourceChain: "spark",
+  apiKey: process.env.FLASHNET_CLIENT_KEY,
+  authMode: "client"
+})
+```
+
+Scoped client-key submissions return a `readToken`. The package stores it on the submitted state and uses it for status reads when the state object is passed back in.
+
+```javascript
+const submitted = await orchestra.executeSwapIntent(intent)
 
 await orchestra.getOrderStatus({
   orderId: submitted.orderId,
-  readToken: submitted.readToken,
-});
+  readToken: submitted.readToken
+})
 ```
 
-Backend proxy integrations can pass auth headers per request:
+Backend proxy integrations can provide auth headers per request:
 
 ```javascript
 const orchestra = new Orchestra(account, {
+  sourceChain: "spark",
   baseUrl: "https://your-api.example.com/orchestra",
   getAuthHeaders: async () => ({
-    Authorization: `Bearer ${await getSessionToken()}`,
-  }),
-});
+    Authorization: `Bearer ${await getSessionToken()}`
+  })
+})
 ```
 
-Direct SSE requires a token in the URL because browser `EventSource` cannot set headers. Admin keys are not used as URL tokens. For admin-key integrations, proxy SSE from your backend or provide a scoped SSE token with `sseToken` or `getSseToken`. Scoped client keys can be used directly when the protocol is configured with `authMode: "client"`.
+Direct browser SSE needs a URL token because `EventSource` cannot set headers. Admin keys are never sent as URL tokens. For admin-key integrations, proxy SSE from your backend or provide a scoped SSE token through `sseToken` or `getSseToken`.
 
 ```javascript
-const orchestra = new Orchestra(account, {
-  apiKey: process.env.FLASHNET_CLIENT_KEY,
-  authMode: "client",
-});
-
 const subscription = orchestra.subscribeOrder(submitted, {
   onStatus: (status) => {
-    console.log(status);
+    console.log(status)
   },
   onError: (err) => {
-    console.error(err);
-  },
-});
+    console.error(err)
+  }
+})
 
-subscription.close();
+subscription.close()
 ```
 
-## Persistence And Recovery
+## State And Recovery
 
 The app must persist every state transition that can affect funds.
-`saveSwap` below is your implementation. It should write the full state object durably and atomically enough that the app can recover after a process crash, tab close, or mobile app restart.
 
 ```javascript
 const orchestra = new Orchestra(account, {
-  apiKey,
   sourceChain: "spark",
+  apiKey,
   onStateChange: async (event, state) => {
-    await saveSwap(state);
-  },
-});
+    await saveSwap(state)
+  }
+})
 ```
+
+`saveSwap` must be your own implementation. It should write the complete state object durably enough that a process crash, browser tab close, mobile app restart, or backend deploy can resume from the latest known state.
 
 State transitions:
 
-| Event                    | Meaning                                                                                             |
-| ------------------------ | --------------------------------------------------------------------------------------------------- |
-| `intent_created`         | Quote exists and has a deposit address. No source funds moved.                                      |
+| Event | Meaning |
+| --- | --- |
+| `intent_created` | Quote exists and has a deposit address. No source funds moved. |
 | `source_payment_started` | The package is about to broadcast or send the source payment. Persist before this callback returns. |
-| `source_payment_sent`    | Source payment returned a transaction id.                                                           |
-| `submitted`              | Orchestra accepted the source transaction and created or updated the order.                         |
+| `source_payment_sent` | Source payment returned a transaction id. |
+| `submitted` | Orchestra accepted the source transaction and created or updated the order. |
 
-Recovery is driven by the most complete state you have:
+Recovery uses the most complete state you have:
 
 ```javascript
-const next = await orchestra.resumeSwap(savedState);
+const next = await orchestra.resumeSwap(savedState)
 ```
 
 Rules:
@@ -387,62 +451,86 @@ Use `allowNewSourcePayment: true` only after checking wallet history for a prior
 
 ```javascript
 await orchestra.resumeSwap(intentOnlyState, {
-  allowNewSourcePayment: true,
-});
+  allowNewSourcePayment: true
+})
 ```
 
 If submit fails after the source payment was sent, the thrown error is `OrchestraSubmitError`. Persist `error.state` before retrying.
 
 ```javascript
 try {
-  const submitted = await orchestra.executeSwapIntent(intent);
-  await saveSwap(submitted);
-  return submitted;
+  const submitted = await orchestra.executeSwapIntent(intent)
+  await saveSwap(submitted)
+  return submitted
 } catch (err) {
-  if (err.name !== "OrchestraSubmitError") throw err;
-  await saveSwap(err.state);
-  return await orchestra.resumeSwap(err.state);
+  if (err.name !== "OrchestraSubmitError") throw err
+  await saveSwap(err.state)
+  return await orchestra.resumeSwap(err.state)
 }
 ```
+
+## Status Mapping
+
+`getSwidgeStatus()` maps Orchestra order status into the WDK Swidge status enum.
+
+| Orchestra status | WDK Swidge status |
+| --- | --- |
+| `processing` or unknown in-flight state | `pending` |
+| `completed` | `completed` |
+| `failed` | `failed` |
+| `unfulfilled` | `failed` |
+| `expired` | `expired` |
+| `refunded` | `refunded` |
+
+## Fee Mapping
+
+Orchestra quote fees are route fees. Source wallet fees are only known after WDK sends the source payment.
+
+| Source | WDK fee type | Included | When known |
+| --- | --- | --- | --- |
+| Orchestra `feeAmount` or `totalFeeAmount` | `protocol` | Yes | Quote and execution |
+| WDK source payment `sourceNetworkFee` | `network` | No | After source payment |
+
+`sourceNetworkFee` is the fee returned by WDK when this package sends the source transaction. It is not an Orchestra fee.
 
 ## Asset References
 
 Use chain-qualified asset references in app code:
 
 ```javascript
-tokenIn: "bsc:USDT";
-tokenOut: "spark:BTC";
+fromToken: "bsc:USDT"
+toToken: "spark:BTC"
 ```
 
-Unqualified assets use the protocol `sourceChain`. This is convenient for a protocol registered on one source wallet, but production UI code should prefer explicit chain prefixes.
+Unqualified assets use the protocol `sourceChain`. Prefer explicit chain prefixes in wallet UI code.
 
 Spark tokens other than BTC need token identifiers:
 
 ```javascript
 const orchestra = new Orchestra(sparkAccount, {
-  apiKey,
   sourceChain: "spark",
+  apiKey,
   sparkTokenIdentifiers: {
-    USDB: "btkn1...",
-  },
-});
+    USDB: "btkn1..."
+  }
+})
 ```
 
 EVM tokens need token contract addresses:
 
 ```javascript
 const orchestra = new Orchestra(bscAccount, {
-  apiKey,
   sourceChain: "bsc",
+  apiKey,
   sourceTokenAddresses: {
-    "bsc:USDT": "0x55d398326f99059ff775485246999027b3197955",
-  },
-});
+    "bsc:USDT": "0x55d398326f99059ff775485246999027b3197955"
+  }
+})
 ```
 
 ## Live Test Harness
 
-The repository includes a local harness for funded smoke tests. These commands move mainnet funds by default. The harness uses Arbitrum because the gas cost is low and the WDK EVM wallet works with a public RPC. This is a harness choice, not a route limitation. The supported USDT route matrix is the source of truth.
+The repository includes a local harness for funded smoke tests. These commands move mainnet funds by default. The harness uses Arbitrum because gas cost is low and the WDK EVM wallet works with a public RPC. The route matrix remains the source of truth for supported chains.
 
 The harness creates a random mnemonic, stores it in `.orchestra-live.env`, prints funding addresses, and stores order state in `.orchestra-live-state/`. Both paths are ignored by git.
 
@@ -498,20 +586,24 @@ EVM source tests require native gas on the source account.
 ## API Surface
 
 ```typescript
-class Orchestra extends SwapProtocol {
-  quoteSwap(options): Promise<Omit<SwapResult, "hash">>;
-  swap(options): Promise<OrchestraSwapResult>;
-  prepareSwap(options, requestOptions?): Promise<OrchestraSwapIntent>;
-  executeSwapIntent(intentOrState, options?): Promise<OrchestraSwapState>;
+class Orchestra extends SwidgeProtocol {
+  quoteSwidge(options): Promise<SwidgeQuote>
+  swidge(options, config?): Promise<SwidgeResult>
+  getSwidgeStatus(id, options?): Promise<SwidgeStatusResult>
+  getSupportedChains(): Promise<SwidgeSupportedChain[]>
+  getSupportedTokens(options?): Promise<SwidgeSupportedToken[]>
+
+  prepareSwap(options, requestOptions?): Promise<OrchestraSwapIntent>
+  executeSwapIntent(intentOrState, options?): Promise<OrchestraSwapState>
   submitSourceTx(
     intentOrState,
     sourceTxHash,
     options?
-  ): Promise<OrchestraSwapState>;
-  resumeSwap(state, options?): Promise<OrchestraSwapState | StatusResponse>;
-  getOrderStatus(target): Promise<StatusResponse>;
-  waitForCompletion(target, options?): Promise<StatusResponse>;
-  subscribeOrder(target, callbacks, options?): OrderSubscription;
+  ): Promise<OrchestraSwapState>
+  resumeSwap(state, options?): Promise<OrchestraSwapState | StatusResponse>
+  getOrderStatus(target): Promise<StatusResponse>
+  waitForCompletion(target, options?): Promise<StatusResponse>
+  subscribeOrder(target, callbacks, options?): OrderSubscription
 }
 ```
 
@@ -524,6 +616,10 @@ npm run lint
 npm run build:types
 npm pack --dry-run
 ```
+
+## Security
+
+See [SECURITY.md](./SECURITY.md).
 
 ## License
 

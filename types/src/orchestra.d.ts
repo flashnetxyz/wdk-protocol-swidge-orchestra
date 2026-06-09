@@ -1,6 +1,18 @@
 import type { IWalletAccount, IWalletAccountReadOnly } from '@tetherto/wdk-wallet'
-import { SwapProtocol } from '@tetherto/wdk-wallet/protocols'
-import type { SwapOptions, SwapResult } from '@tetherto/wdk-wallet/protocols'
+import { SwidgeProtocol } from '@tetherto/wdk-wallet/protocols'
+import type {
+  SwapOptions,
+  SwapResult,
+  SwidgeOptions,
+  SwidgeProtocolConfig,
+  SwidgeQuote,
+  SwidgeResult,
+  SwidgeStatusOptions,
+  SwidgeStatusResult,
+  SwidgeSupportedChain,
+  SwidgeSupportedToken,
+  SwidgeSupportedTokensOptions
+} from '@tetherto/wdk-wallet/protocols'
 import type { OrchestraClient } from './orchestra-client.js'
 
 export type AuthMode = 'admin' | 'client' | 'auto'
@@ -10,7 +22,7 @@ export type OrchestraAuthHeaders =
   | Headers
   | Promise<Record<string, string> | Headers>
 
-export interface OrchestraConfig {
+export interface OrchestraConfig extends SwidgeProtocolConfig {
   apiKey?: string
   baseUrl?: string
   fetch?: typeof fetch
@@ -27,6 +39,7 @@ export interface OrchestraConfig {
   tokenAddresses?: Record<string, string>
   assetAddresses?: Record<string, string>
   nativeAssets?: Record<string, string>
+  tokenDecimals?: Record<string, number>
   slippageBps?: number
   timeoutMs?: number
   maxRetries?: number
@@ -36,7 +49,6 @@ export interface OrchestraConfig {
   quoteExpirySafetyMs?: number
   pollIntervalMs?: number
   waitTimeoutMs?: number
-  allowOneShotSwap?: boolean
   idempotencyKeyFactory?: () => string
   onIntent?: (intent: OrchestraSwapIntent) => void | Promise<void>
   onStateChange?: (
@@ -79,7 +91,39 @@ export type OrchestraSwapOptions = SwapOptions & {
   appFees?: AppFee[]
   affiliateId?: string
   affiliateIds?: string[]
-  allowOneShot?: boolean
+}
+
+export type OrchestraAmount = number | bigint | string
+
+export type OrchestraSwidgeOptions = Omit<SwidgeOptions, 'fromTokenAmount' | 'toTokenAmount'> & (
+  | { fromTokenAmount: OrchestraAmount, toTokenAmount?: undefined }
+  | { fromTokenAmount?: undefined, toTokenAmount: OrchestraAmount }
+) & {
+  fromChain?: string | number
+  refundChain?: string
+  slippageBps?: number
+  idempotencyKey?: string
+  submitIdempotencyKey?: string
+  sourceTxHash?: string
+  sourceNetworkFee?: bigint | number | string
+  sourceAddress?: string
+  sourceTxVout?: number
+  sourceSparkAddress?: string
+  sourceTokenIdentifier?: string
+  sourceTokenAddress?: string
+  feeRate?: number | bigint
+  confirmationTarget?: number
+  broadcastTimeoutMs?: number
+  allowNewSourcePayment?: boolean
+  ignoreQuoteExpiry?: boolean
+  quoteExpirySafetyMs?: number
+  appFees?: AppFee[]
+  affiliateId?: string
+  affiliateIds?: string[]
+}
+
+export type OrchestraSwidgeStatusOptions = SwidgeStatusOptions & {
+  readToken?: string
 }
 
 export interface PrepareSwapOptions {
@@ -189,14 +233,24 @@ export interface OrderSubscriptionCallbacks {
   onClose?: () => void
 }
 
-export default class Orchestra extends SwapProtocol {
+export default class Orchestra extends SwidgeProtocol {
+  constructor(account?: undefined, config?: OrchestraConfig)
   constructor(account: IWalletAccountReadOnly, config?: OrchestraConfig)
   constructor(account: IWalletAccount, config?: OrchestraConfig)
 
-  quoteSwap(options: OrchestraSwapOptions | SwapOptions): Promise<Omit<SwapResult, 'hash'>>
-  swap(options: OrchestraSwapOptions | SwapOptions): Promise<OrchestraSwapResult>
+  quoteSwidge(options: OrchestraSwidgeOptions | SwidgeOptions): Promise<SwidgeQuote>
+  swidge(
+    options: OrchestraSwidgeOptions | SwidgeOptions,
+    config?: SwidgeProtocolConfig & ExecuteSwapOptions
+  ): Promise<SwidgeResult>
+  getSwidgeStatus(
+    id: string,
+    options?: OrchestraSwidgeStatusOptions
+  ): Promise<SwidgeStatusResult>
+  getSupportedChains(): Promise<SwidgeSupportedChain[]>
+  getSupportedTokens(options?: SwidgeSupportedTokensOptions): Promise<SwidgeSupportedToken[]>
   prepareSwap(
-    options: OrchestraSwapOptions | SwapOptions,
+    options: OrchestraSwapOptions | SwapOptions | OrchestraSwidgeOptions | SwidgeOptions,
     requestOptions?: PrepareSwapOptions
   ): Promise<OrchestraSwapIntent>
   executeSwapIntent(

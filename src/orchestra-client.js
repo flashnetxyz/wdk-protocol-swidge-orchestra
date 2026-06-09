@@ -134,6 +134,10 @@ export class OrchestraClient {
     })
   }
 
+  async getRoutes () {
+    return await this._requestJson('GET', '/v1/orchestration/routes')
+  }
+
   subscribeStatus (orderId, callbacks, options = {}) {
     const controller = new AbortController()
     let closed = false

@@ -1,7 +1,5 @@
 import { beforeEach, describe, expect, jest, test } from '@jest/globals'
-import WDK from '@tetherto/wdk'
-import WalletManager from '@tetherto/wdk-wallet'
-import { SwapProtocol } from '@tetherto/wdk-wallet/protocols'
+import { SwidgeProtocol } from '@tetherto/wdk-wallet/protocols'
 
 import Orchestra, {
   OrchestraClient,
@@ -28,6 +26,14 @@ const SUBMIT_CLIENT = {
   readToken: 'read_client_token'
 }
 
+const ROUTES = {
+  routes: [
+    { sourceChain: 'spark', sourceAsset: 'BTC', destinationChain: 'tron', destinationAsset: 'USDT' },
+    { sourceChain: 'bsc', sourceAsset: 'USDT', destinationChain: 'spark', destinationAsset: 'BTC' },
+    { sourceChain: 'bitcoin', sourceAsset: 'BTC', destinationChain: 'ton', destinationAsset: 'USDT' }
+  ]
+}
+
 function jsonResponse (body, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -45,17 +51,6 @@ function createFetch (responses) {
 
 function readJsonBody (call) {
   return JSON.parse(call[1].body)
-}
-
-class FakeWalletManager extends WalletManager {
-  constructor (seed, config) {
-    super(seed, config)
-    this.account = config.account
-  }
-
-  async getAccount () {
-    return this.account
-  }
 }
 
 describe('Orchestra', () => {
@@ -100,17 +95,144 @@ describe('Orchestra', () => {
     expect(fetch.mock.calls[0][1].headers.Authorization).toBe('Bearer fn_admin_key')
   })
 
-  test('registers as a WDK swap protocol with the shared SwapProtocol identity', async () => {
-    const seed = WDK.getRandomSeedPhrase(12)
-    const wdk = new WDK(seed)
-      .registerWallet('spark', FakeWalletManager, { account })
-      .registerProtocol('spark', 'orchestra', Orchestra, { sourceChain: 'spark' })
+  test('quoteSwidge maps Orchestra estimates to Swidge quotes', async () => {
+    const fetch = createFetch([
+      { body: { estimatedOut: '990000', feeAmount: '5', totalFeeAmount: '10', feeAsset: 'USDT', expiresAt: '2099-01-01T00:00:00.000Z' } }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch,
+      sourceChain: 'spark'
+    })
 
-    const wdkAccount = await wdk.getAccount('spark', 0)
-    const protocol = wdkAccount.getSwapProtocol('orchestra')
+    const quote = await protocol.quoteSwidge({
+      fromToken: 'BTC',
+      toToken: 'tron:USDT',
+      fromTokenAmount: 1000n,
+      recipient: 'TRecipient',
+      slippage: 0.01
+    })
+
+    expect(quote).toEqual({
+      fromTokenAmount: 1000n,
+      toTokenAmount: 990000n,
+      toTokenAmountMin: 990000n,
+      expiry: 4070908800,
+      fees: [{
+        type: 'protocol',
+        amount: 10n,
+        token: 'USDT',
+        included: true,
+        description: 'Orchestra protocol fee'
+      }]
+    })
+    expect(String(fetch.mock.calls[0][0])).toContain('sourceChain=spark')
+    expect(String(fetch.mock.calls[0][0])).toContain('destinationChain=tron')
+    expect(String(fetch.mock.calls[0][0])).toContain('slippageBps=100')
+  })
+
+  test('swidge executes through Orchestra and returns a Swidge result', async () => {
+    account.sendTransaction.mockResolvedValueOnce({ hash: 'spark_transfer_btc', fee: 2n })
+    const fetch = createFetch([
+      { body: QUOTE },
+      { body: SUBMIT_CLIENT }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'spark',
+      idempotencyKeyFactory: () => ids.shift()
+    })
+
+    const result = await protocol.swidge({
+      fromToken: 'BTC',
+      toToken: 'tron:USDT',
+      fromTokenAmount: 1000n,
+      recipient: 'TRecipient'
+    })
+
+    expect(result).toEqual({
+      id: 'ord_123',
+      hash: 'spark_transfer_btc',
+      fees: [
+        {
+          type: 'network',
+          amount: 2n,
+          token: 'BTC',
+          chain: 'spark',
+          included: false,
+          description: 'Source wallet network fee'
+        },
+        {
+          type: 'protocol',
+          amount: 10n,
+          token: 'USDC',
+          included: true,
+          description: 'Orchestra protocol fee'
+        }
+      ],
+      transactions: [{ hash: 'spark_transfer_btc', chain: 'spark', type: 'source' }],
+      fromTokenAmount: 1000n,
+      toTokenAmount: 990000n,
+      toTokenAmountMin: 990000n
+    })
+  })
+
+  test('inherited swap delegates through swidge', async () => {
+    account.sendTransaction.mockResolvedValueOnce({ hash: 'spark_transfer_btc', fee: 2n })
+    const fetch = createFetch([
+      { body: QUOTE },
+      { body: SUBMIT_CLIENT }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'spark',
+      idempotencyKeyFactory: () => ids.shift()
+    })
+
+    const result = await protocol.swap({
+      tokenIn: 'BTC',
+      tokenOut: 'tron:USDT',
+      tokenInAmount: 1000n,
+      to: 'TRecipient'
+    })
+
+    expect(result).toEqual({
+      hash: 'ord_123',
+      fee: 12n,
+      tokenInAmount: 1000n,
+      tokenOutAmount: 990000n
+    })
+  })
+
+  test('inherited quoteBridge delegates through quoteSwidge fee mapping', async () => {
+    const fetch = createFetch([
+      { body: { estimatedOut: '990000', feeAmount: '5', totalFeeAmount: '10', feeAsset: 'USDT' } }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch,
+      sourceChain: 'bsc'
+    })
+
+    const result = await protocol.quoteBridge({
+      token: 'USDT',
+      targetChain: 'tron',
+      recipient: 'TRecipient',
+      amount: 1000n
+    })
+
+    expect(result).toEqual({ fee: 0n, bridgeFee: 10n })
+    expect(String(fetch.mock.calls[0][0])).toContain('sourceChain=bsc')
+    expect(String(fetch.mock.calls[0][0])).toContain('destinationChain=tron')
+  })
+
+  test('implements the WDK SwidgeProtocol identity', async () => {
+    const protocol = new Orchestra(account, { sourceChain: 'spark' })
 
     expect(protocol).toBeInstanceOf(Orchestra)
-    expect(protocol).toBeInstanceOf(SwapProtocol)
+    expect(protocol).toBeInstanceOf(SwidgeProtocol)
   })
 
   test('prepareSwap creates a durable intent with quote and submit idempotency keys', async () => {
@@ -419,6 +541,52 @@ describe('Orchestra', () => {
 
     expect(fetch.mock.calls[0][1].headers.Authorization).toBe('Bearer fn_admin_key')
     expect(fetch.mock.calls[0][1].headers['X-Read-Token']).toBeUndefined()
+  })
+
+  test('getSwidgeStatus maps Orchestra order status to Swidge status', async () => {
+    const fetch = createFetch([
+      { body: { order: { id: 'ord_123', status: 'processing', sourceTxHash: 'spark_transfer_btc' }, stages: [] } },
+      { body: { order: { id: 'ord_123', status: 'completed', sourceTxHash: 'spark_transfer_btc', destinationTxHash: '0xdest' }, stages: [] } }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch
+    })
+
+    await expect(protocol.getSwidgeStatus('ord_123', { fromChain: 'spark', toChain: 'tron' })).resolves.toEqual({
+      status: 'pending',
+      transactions: [{ hash: 'spark_transfer_btc', chain: 'spark', type: 'source' }]
+    })
+    await expect(protocol.getSwidgeStatus('ord_123', { fromChain: 'spark', toChain: 'tron' })).resolves.toEqual({
+      status: 'completed',
+      transactions: [
+        { hash: 'spark_transfer_btc', chain: 'spark', type: 'source' },
+        { hash: '0xdest', chain: 'tron', type: 'destination' }
+      ]
+    })
+  })
+
+  test('getSupportedChains and getSupportedTokens read the Orchestra route matrix', async () => {
+    const fetch = createFetch([
+      { body: ROUTES },
+      { body: ROUTES }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_admin_key',
+      fetch
+    })
+
+    await expect(protocol.getSupportedChains()).resolves.toEqual([
+      { id: 'bitcoin', name: 'Bitcoin', type: 'utxo', nativeToken: 'BTC' },
+      { id: 'bsc', name: 'BNB Smart Chain', type: 'evm', nativeToken: 'BNB' },
+      { id: 'spark', name: 'Spark', type: 'spark', nativeToken: 'BTC' },
+      { id: 'ton', name: 'TON', type: 'tvm', nativeToken: 'TON' },
+      { id: 'tron', name: 'TRON', type: 'tvm', nativeToken: 'TRX' }
+    ])
+    await expect(protocol.getSupportedTokens({ fromChain: 'spark', toChain: 'tron' })).resolves.toEqual([
+      { token: 'spark:BTC', chain: 'spark', symbol: 'BTC', decimals: 8 },
+      { token: 'tron:USDT', chain: 'tron', symbol: 'USDT', decimals: 6, address: 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t' }
+    ])
   })
 
   test('waitForCompletion polls until a terminal status', async () => {

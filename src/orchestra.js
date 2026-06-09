@@ -14,7 +14,7 @@
 
 'use strict'
 
-import { SwapProtocol } from '@tetherto/wdk-wallet/protocols'
+import { SwidgeProtocol } from '@tetherto/wdk-wallet/protocols'
 
 import { normalizeChain, parseAssetRef, stringifyAmount, toBigIntAmount } from './asset-refs.js'
 import { OrchestraClient, isTerminalOrderStatus } from './orchestra-client.js'
@@ -24,6 +24,14 @@ import { OrchestraStateError, OrchestraSubmitError, OrchestraTimeoutError } from
 /** @typedef {import('@tetherto/wdk-wallet').IWalletAccountReadOnly} IWalletAccountReadOnly */
 /** @typedef {import('@tetherto/wdk-wallet/protocols').SwapOptions} SwapOptions */
 /** @typedef {import('@tetherto/wdk-wallet/protocols').SwapResult} SwapResult */
+/** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeOptions} SwidgeOptions */
+/** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeQuote} SwidgeQuote */
+/** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeResult} SwidgeResult */
+/** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeProtocolConfig} SwidgeProtocolConfig */
+/** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeStatusResult} SwidgeStatusResult */
+/** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeSupportedChain} SwidgeSupportedChain */
+/** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeSupportedToken} SwidgeSupportedToken */
+/** @typedef {import('@tetherto/wdk-wallet/protocols').SwidgeSupportedTokensOptions} SwidgeSupportedTokensOptions */
 
 const INTENT_VERSION = 1
 const DEFAULT_POLL_INTERVAL_MS = 1_500
@@ -41,6 +49,35 @@ const NATIVE_ASSETS = Object.freeze({
   polygon: 'POL',
   solana: 'SOL',
   tron: 'TRX'
+})
+
+const CHAIN_METADATA = Object.freeze({
+  arbitrum: { name: 'Arbitrum', type: 'evm', nativeToken: 'ETH' },
+  avalanche: { name: 'Avalanche', type: 'evm', nativeToken: 'AVAX' },
+  base: { name: 'Base', type: 'evm', nativeToken: 'ETH' },
+  bitcoin: { name: 'Bitcoin', type: 'utxo', nativeToken: 'BTC' },
+  bsc: { name: 'BNB Smart Chain', type: 'evm', nativeToken: 'BNB' },
+  ethereum: { name: 'Ethereum', type: 'evm', nativeToken: 'ETH' },
+  lightning: { name: 'Lightning', type: 'lightning', nativeToken: 'BTC' },
+  monad: { name: 'Monad', type: 'evm', nativeToken: 'MON' },
+  optimism: { name: 'Optimism', type: 'evm', nativeToken: 'ETH' },
+  plasma: { name: 'Plasma', type: 'evm', nativeToken: 'XPL' },
+  polygon: { name: 'Polygon', type: 'evm', nativeToken: 'POL' },
+  solana: { name: 'Solana', type: 'svm', nativeToken: 'SOL' },
+  spark: { name: 'Spark', type: 'spark', nativeToken: 'BTC' },
+  ton: { name: 'TON', type: 'tvm', nativeToken: 'TON' },
+  tron: { name: 'TRON', type: 'tvm', nativeToken: 'TRX' }
+})
+
+const TOKEN_DECIMALS = Object.freeze({
+  BTC: 8,
+  DAI: 18,
+  ETH: 18,
+  POL: 18,
+  USDB: 6,
+  USDC: 6,
+  'USDC.e': 6,
+  USDT: 6
 })
 
 const DEFAULT_TOKEN_ADDRESSES = Object.freeze({
@@ -83,6 +120,23 @@ function stateAmount (amount, field) {
   return toBigIntAmount(amount ?? 0n, field).toString()
 }
 
+function unixSeconds (iso) {
+  const timestamp = Date.parse(iso)
+  return Number.isFinite(timestamp) ? Math.floor(timestamp / 1000) : undefined
+}
+
+function basisPoints (amount, inputAmount) {
+  return inputAmount > 0n ? (amount * 10_000n) / inputAmount : 0n
+}
+
+function slippageToBps (slippage) {
+  if (slippage === undefined || slippage === null) return undefined
+  if (typeof slippage !== 'number' || !Number.isFinite(slippage) || slippage < 0) {
+    throw new OrchestraStateError('slippage must be a non-negative decimal number.')
+  }
+  return Math.round(slippage * 10_000)
+}
+
 function normalizeSubmittedState (intent, transfer, submit) {
   return {
     ...intent,
@@ -120,7 +174,32 @@ function readTransferHash (result, operation) {
   throw new OrchestraStateError(`${operation} returned without a transaction hash.`)
 }
 
-export default class Orchestra extends SwapProtocol {
+function routeStatusToSwidgeStatus (status) {
+  if (status === 'completed') return 'completed'
+  if (status === 'expired') return 'expired'
+  if (status === 'refunded') return 'refunded'
+  if (status === 'failed' || status === 'unfulfilled') return 'failed'
+  return 'pending'
+}
+
+function routeFromParts (sourceChain, sourceAsset, destinationChain, destinationAsset) {
+  return {
+    sourceChain: normalizeChain(sourceChain),
+    sourceAsset,
+    destinationChain: normalizeChain(destinationChain),
+    destinationAsset
+  }
+}
+
+export default class Orchestra extends SwidgeProtocol {
+  /**
+   * Creates a discovery-only interface to Orchestra.
+   *
+   * @overload
+   * @param {undefined} [account]
+   * @param {OrchestraConfig} [config]
+   */
+
   /**
    * Creates a new read-only interface to Orchestra.
    *
@@ -145,14 +224,14 @@ export default class Orchestra extends SwapProtocol {
   }
 
   /**
-   * Side-effect-free WDK quote. This calls Orchestra's estimate endpoint and
-   * does not reserve a deposit address.
+   * Side-effect-free Swidge quote. This calls Orchestra's estimate endpoint
+   * and does not reserve a deposit address.
    *
-   * @param {OrchestraSwapOptions | SwapOptions} options
-   * @returns {Promise<Omit<SwapResult, 'hash'>>}
+   * @param {OrchestraSwidgeOptions | SwidgeOptions} options
+   * @returns {Promise<SwidgeQuote>}
    */
-  async quoteSwap (options) {
-    const params = await this._normalizeSwapOptions(options)
+  async quoteSwidge (options) {
+    const params = await this._normalizeSwapOptions(this._fromSwidgeOptions(options))
     const estimate = await this._client.estimate({
       sourceChain: params.sourceChain,
       sourceAsset: params.sourceAsset,
@@ -168,52 +247,139 @@ export default class Orchestra extends SwapProtocol {
     })
 
     return {
-      fee: toBigIntAmount(estimate.totalFeeAmount ?? estimate.feeAmount ?? 0n, 'feeAmount'),
-      tokenInAmount: params.amountMode === 'exact_out'
+      fromTokenAmount: params.amountMode === 'exact_out'
         ? toBigIntAmount(estimate.requiredAmountIn ?? estimate.amountIn, 'requiredAmountIn')
-        : toBigIntAmount(params.amount, 'tokenInAmount'),
-      tokenOutAmount: params.amountMode === 'exact_out'
-        ? toBigIntAmount(params.amount, 'tokenOutAmount')
-        : toBigIntAmount(estimate.estimatedOut, 'estimatedOut')
+        : toBigIntAmount(params.amount, 'fromTokenAmount'),
+      toTokenAmount: params.amountMode === 'exact_out'
+        ? toBigIntAmount(params.amount, 'toTokenAmount')
+        : toBigIntAmount(estimate.estimatedOut, 'estimatedOut'),
+      toTokenAmountMin: this._minimumToTokenAmount(estimate, params),
+      fees: this._quoteFees(estimate, params),
+      ...optionalObject('expiry', unixSeconds(estimate.expiresAt))
     }
   }
 
   /**
-   * One-shot WDK swap. Host apps should prefer prepareSwap + executeSwapIntent
-   * so they can persist the returned intent before any source funds move.
+   * Executes an Orchestra swidge. Host apps can still use prepareSwap +
+   * executeSwapIntent when they want an explicit persistence boundary between
+   * quote creation and source payment.
    *
-   * @param {OrchestraSwapOptions | SwapOptions} options
-   * @returns {Promise<OrchestraSwapResult>}
+   * @param {OrchestraSwidgeOptions | SwidgeOptions} options
+   * @param {SwidgeProtocolConfig & ExecuteSwapOptions} [config]
+   * @returns {Promise<SwidgeResult>}
    */
-  async swap (options) {
-    if (options.allowOneShot !== true && this._config.allowOneShotSwap !== true) {
-      throw new OrchestraStateError('swap() moves funds without a caller-visible persistence boundary. Use prepareSwap() + executeSwapIntent(), or pass allowOneShot: true for controlled tests.')
-    }
-    const intent = await this.prepareSwap(options)
-    await this._emitState('quoted', intent)
-    const submitted = await this.executeSwapIntent(intent)
+  async swidge (options, config = {}) {
+    this._assertWritableAccount()
+    const mergedConfig = { ...this._config, ...config }
+    const swapOptions = this._fromSwidgeOptions(options)
+    const intent = await this.prepareSwap(swapOptions, {
+      idempotencyKey: options.idempotencyKey,
+      submitIdempotencyKey: options.submitIdempotencyKey
+    })
+    this._enforceFeeLimits(this._intentFees(intent), toBigIntAmount(intent.amountIn, 'amountIn'), mergedConfig)
+    const submitted = await this.executeSwapIntent(intent, { ...options, ...config })
+    const fees = this._stateFees(submitted)
+    this._enforceFeeLimits(fees, toBigIntAmount(submitted.amountIn, 'amountIn'), mergedConfig)
+    const transactions = submitted.sourceTxHash
+      ? [{ hash: submitted.sourceTxHash, chain: submitted.sourceChain, type: 'source' }]
+      : undefined
     return {
+      id: submitted.orderId,
       hash: submitted.sourceTxHash,
-      fee: toBigIntAmount(submitted.sourceNetworkFee ?? 0n, 'sourceNetworkFee'),
-      tokenInAmount: toBigIntAmount(submitted.amountIn, 'amountIn'),
-      tokenOutAmount: toBigIntAmount(submitted.estimatedOut, 'estimatedOut'),
-      quoteId: submitted.quoteId,
-      orderId: submitted.orderId,
-      status: submitted.status,
-      readToken: submitted.readToken
+      fees,
+      ...optionalObject('transactions', transactions),
+      fromTokenAmount: toBigIntAmount(submitted.amountIn, 'amountIn'),
+      toTokenAmount: toBigIntAmount(submitted.estimatedOut, 'estimatedOut'),
+      toTokenAmountMin: toBigIntAmount(submitted.estimatedOut, 'estimatedOut')
     }
+  }
+
+  /**
+   * Retrieves the current Swidge status for an Orchestra order id.
+   *
+   * @param {string} id
+   * @param {OrchestraSwidgeStatusOptions} [options]
+   * @returns {Promise<SwidgeStatusResult>}
+   */
+  async getSwidgeStatus (id, options = {}) {
+    const status = await this.getOrderStatus({ orderId: id, readToken: options.readToken })
+    const order = status.order ?? status
+    return {
+      status: routeStatusToSwidgeStatus(order.status ?? status.status),
+      transactions: this._statusTransactions(status, options)
+    }
+  }
+
+  /**
+   * Returns chains exposed by Orchestra's live route matrix.
+   *
+   * @returns {Promise<SwidgeSupportedChain[]>}
+   */
+  async getSupportedChains () {
+    const routes = await this._routes()
+    const chains = new Set()
+    for (const route of routes) {
+      if (route.sourceChain) chains.add(normalizeChain(route.sourceChain))
+      if (route.destinationChain) chains.add(normalizeChain(route.destinationChain))
+    }
+    return [...chains].sort().map(chain => ({
+      id: chain,
+      name: CHAIN_METADATA[chain]?.name ?? chain,
+      type: CHAIN_METADATA[chain]?.type ?? 'unknown',
+      nativeToken: CHAIN_METADATA[chain]?.nativeToken ?? NATIVE_ASSETS[chain] ?? ''
+    }))
+  }
+
+  /**
+   * Returns tokens exposed by Orchestra's live route matrix.
+   *
+   * @param {SwidgeSupportedTokensOptions} [options]
+   * @returns {Promise<SwidgeSupportedToken[]>}
+   */
+  async getSupportedTokens (options = {}) {
+    const routes = await this._routes()
+    const fromChain = normalizeChain(options.fromChain)
+    const toChain = normalizeChain(options.toChain)
+    const fromToken = options.fromToken
+    const seen = new Set()
+    const tokens = []
+    const push = (chain, symbol) => {
+      const normalizedChain = normalizeChain(chain)
+      const key = `${normalizedChain}:${symbol}`
+      if (!normalizedChain || !symbol || seen.has(key)) return
+      seen.add(key)
+      tokens.push({
+        token: `${normalizedChain}:${symbol}`,
+        chain: normalizedChain,
+        symbol,
+        decimals: this._tokenDecimals(normalizedChain, symbol),
+        ...optionalObject('address', this._resolveSourceTokenAddress(normalizedChain, symbol))
+      })
+    }
+    for (const route of routes) {
+      const source = routeFromParts(route.sourceChain, route.sourceAsset, route.destinationChain, route.destinationAsset)
+      if (fromChain && source.sourceChain !== fromChain) continue
+      if (toChain && source.destinationChain !== toChain) continue
+      if (fromToken) {
+        const parsed = parseAssetRef(fromToken, source.sourceChain)
+        if (source.sourceChain !== parsed.chain || source.sourceAsset !== parsed.asset) continue
+      }
+      push(source.sourceChain, source.sourceAsset)
+      push(source.destinationChain, source.destinationAsset)
+    }
+    return tokens
   }
 
   /**
    * Creates a durable Orchestra quote and returns a serializable intent. Persist
    * this object before calling executeSwapIntent.
    *
-   * @param {OrchestraSwapOptions | SwapOptions} options
+   * @param {OrchestraSwapOptions | OrchestraSwidgeOptions | SwidgeOptions} options
    * @param {PrepareSwapOptions} [requestOptions]
    * @returns {Promise<OrchestraSwapIntent>}
    */
   async prepareSwap (options, requestOptions = {}) {
-    const params = await this._normalizeSwapOptions(options)
+    const params = await this._normalizeSwapOptions(this._fromSwidgeOptions(options))
     const quoteIdempotencyKey = requestOptions.idempotencyKey ?? this._idempotencyKeyFactory()
     const submitIdempotencyKey = requestOptions.submitIdempotencyKey ?? this._idempotencyKeyFactory()
     const quote = await this._client.createQuote({
@@ -390,6 +556,139 @@ export default class Orchestra extends SwapProtocol {
     })
   }
 
+  _fromSwidgeOptions (options) {
+    if (!options.fromToken && !options.toToken) return options
+    const sourceChain = normalizeChain(options.fromChain) ?? this._defaultSourceChain()
+    const source = parseAssetRef(options.fromToken, sourceChain)
+    const destinationChain = normalizeChain(options.toChain) ?? source.chain
+    const destination = parseAssetRef(options.toToken, destinationChain)
+    if (options.fromTokenAmount !== undefined && options.toTokenAmount !== undefined) {
+      throw new OrchestraStateError('Specify only one of fromTokenAmount or toTokenAmount.')
+    }
+    return {
+      ...options,
+      tokenIn: `${source.chain}:${source.asset}`,
+      tokenOut: `${destination.chain}:${destination.asset}`,
+      tokenInAmount: options.fromTokenAmount,
+      tokenOutAmount: options.toTokenAmount,
+      to: options.recipient,
+      refundChain: options.refundChain ?? source.chain,
+      refundAddress: options.refundAddress,
+      slippageBps: options.slippageBps ?? slippageToBps(options.slippage)
+    }
+  }
+
+  _minimumToTokenAmount (quote, params) {
+    if (params.amountMode === 'exact_out') return toBigIntAmount(params.amount, 'toTokenAmount')
+    return toBigIntAmount(
+      quote.minAmountOut ??
+      quote.minimumOut ??
+      quote.minOut ??
+      quote.guaranteedOut ??
+      quote.estimatedOut,
+      'toTokenAmountMin'
+    )
+  }
+
+  _quoteFees (quote, params) {
+    return [{
+      type: 'protocol',
+      amount: toBigIntAmount(quote.totalFeeAmount ?? quote.feeAmount ?? 0n, 'feeAmount'),
+      token: quote.feeAsset ?? params.sourceAsset,
+      included: true,
+      description: 'Orchestra protocol fee'
+    }]
+  }
+
+  _intentFees (intent) {
+    return [{
+      type: 'protocol',
+      amount: toBigIntAmount(intent.totalFeeAmount ?? intent.feeAmount ?? 0n, 'feeAmount'),
+      token: intent.feeAsset ?? intent.sourceAsset,
+      included: true,
+      description: 'Orchestra protocol fee'
+    }]
+  }
+
+  _stateFees (state) {
+    return [
+      {
+        type: 'network',
+        amount: toBigIntAmount(state.sourceNetworkFee ?? 0n, 'sourceNetworkFee'),
+        token: CHAIN_METADATA[state.sourceChain]?.nativeToken ?? state.sourceAsset,
+        chain: state.sourceChain,
+        included: false,
+        description: 'Source wallet network fee'
+      },
+      ...this._intentFees(state)
+    ]
+  }
+
+  _enforceFeeLimits (fees, inputAmount, config) {
+    this._enforceFeeLimit(
+      fees.filter(fee => fee.type === 'network').reduce((total, fee) => total + fee.amount, 0n),
+      inputAmount,
+      config.maxNetworkFeeBps,
+      'network'
+    )
+    this._enforceFeeLimit(
+      fees.filter(fee => fee.type === 'protocol').reduce((total, fee) => total + fee.amount, 0n),
+      inputAmount,
+      config.maxProtocolFeeBps,
+      'protocol'
+    )
+  }
+
+  _enforceFeeLimit (feeAmount, inputAmount, maxBps, feeType) {
+    if (maxBps === undefined || maxBps === null) return
+    if (
+      (typeof maxBps === 'number' && (!Number.isInteger(maxBps) || maxBps < 0)) ||
+      (typeof maxBps === 'bigint' && maxBps < 0n) ||
+      (typeof maxBps !== 'number' && typeof maxBps !== 'bigint')
+    ) {
+      throw new OrchestraStateError(`max${feeType[0].toUpperCase()}${feeType.slice(1)}FeeBps must be a non-negative integer.`)
+    }
+    const max = BigInt(maxBps)
+    const actual = basisPoints(feeAmount, inputAmount)
+    if (actual > max) {
+      throw new OrchestraStateError(`Orchestra ${feeType} fee exceeds configured maximum.`, {
+        feeType,
+        feeBps: actual.toString(),
+        maxFeeBps: max.toString()
+      })
+    }
+  }
+
+  async _routes () {
+    const body = await this._client.getRoutes()
+    return Array.isArray(body.routes) ? body.routes : []
+  }
+
+  _tokenDecimals (chain, symbol) {
+    return this._config.tokenDecimals?.[`${normalizeChain(chain)}:${symbol}`] ??
+      this._config.tokenDecimals?.[symbol] ??
+      TOKEN_DECIMALS[symbol] ??
+      0
+  }
+
+  _statusTransactions (status, options) {
+    const order = status.order ?? status
+    const transactions = []
+    const sourceHash = order.sourceTxHash ?? order.txHash ?? order.depositTxHash ?? status.sourceTxHash
+    const destinationHash = order.destinationTxHash ?? order.payoutTxHash ?? order.withdrawTxHash ?? status.destinationTxHash
+    const refundHash = order.refundTxHash ?? status.refundTxHash
+    if (sourceHash) transactions.push({ hash: sourceHash, chain: options.fromChain, type: 'source' })
+    if (destinationHash) transactions.push({ hash: destinationHash, chain: options.toChain, type: 'destination' })
+    if (refundHash) transactions.push({ hash: refundHash, chain: options.fromChain, type: 'refund' })
+    return transactions
+  }
+
+  _assertWritableAccount () {
+    if (!this._account || (typeof this._account.sendTransaction !== 'function' && typeof this._account.transfer !== 'function')) {
+      throw new OrchestraStateError('A writable WDK account is required to execute Orchestra swidge operations.')
+    }
+  }
+
   async _normalizeSwapOptions (options) {
     const tokenInRef = options.source
       ? `${options.source.chain}:${options.source.asset}`
@@ -458,6 +757,7 @@ export default class Orchestra extends SwapProtocol {
   }
 
   async _defaultRecipientAddress (destinationChain) {
+    if (!this._account) return undefined
     if (normalizeChain(destinationChain) !== this._defaultSourceChain()) return undefined
     return await this._account.getAddress()
   }
@@ -665,7 +965,10 @@ export default class Orchestra extends SwapProtocol {
  * @property {Record<string, string>} [tokenAddresses] Alias for sourceTokenAddresses.
  * @property {Record<string, string>} [assetAddresses] Alias for sourceTokenAddresses.
  * @property {Record<string, string>} [nativeAssets] Native asset symbols keyed by chain.
+ * @property {Record<string, number>} [tokenDecimals] Token decimals keyed by '<chain>:<asset>' or asset symbol.
  * @property {number} [slippageBps]
+ * @property {number | bigint} [maxNetworkFeeBps]
+ * @property {number | bigint} [maxProtocolFeeBps]
  * @property {number} [timeoutMs]
  * @property {number} [maxRetries]
  * @property {number} [retryDelayMs]
@@ -674,7 +977,6 @@ export default class Orchestra extends SwapProtocol {
  * @property {number} [quoteExpirySafetyMs]
  * @property {number} [pollIntervalMs]
  * @property {number} [waitTimeoutMs]
- * @property {boolean} [allowOneShotSwap]
  * @property {() => string} [idempotencyKeyFactory]
  * @property {(intent: OrchestraSwapIntent) => void | Promise<void>} [onIntent]
  * @property {(event: string, state: OrchestraSwapIntent | OrchestraSwapState) => void | Promise<void>} [onStateChange]
@@ -701,7 +1003,38 @@ export default class Orchestra extends SwapProtocol {
  * @property {Array<{ recipient: string, fee: number }>} [appFees]
  * @property {string} [affiliateId]
  * @property {string[]} [affiliateIds]
- * @property {boolean} [allowOneShot]
+ */
+
+/**
+ * @typedef {SwidgeOptions & Object} OrchestraSwidgeOptions
+ * @property {string | number} [fromChain]
+ * @property {string} [refundChain]
+ * @property {number} [slippageBps]
+ * @property {string} [idempotencyKey]
+ * @property {string} [submitIdempotencyKey]
+ * @property {string} [sourceTxHash]
+ * @property {bigint | number | string} [sourceNetworkFee]
+ * @property {string} [sourceAddress]
+ * @property {number} [sourceTxVout]
+ * @property {string} [sourceSparkAddress]
+ * @property {string} [sourceTokenIdentifier]
+ * @property {string} [sourceTokenAddress]
+ * @property {number | bigint} [feeRate]
+ * @property {number} [confirmationTarget]
+ * @property {number} [broadcastTimeoutMs]
+ * @property {boolean} [allowNewSourcePayment]
+ * @property {boolean} [ignoreQuoteExpiry]
+ * @property {number} [quoteExpirySafetyMs]
+ * @property {Array<{ recipient: string, fee: number }>} [appFees]
+ * @property {string} [affiliateId]
+ * @property {string[]} [affiliateIds]
+ */
+
+/**
+ * @typedef {Object} OrchestraSwidgeStatusOptions
+ * @property {string | number} [fromChain]
+ * @property {string | number} [toChain]
+ * @property {string} [readToken]
  */
 
 /**
