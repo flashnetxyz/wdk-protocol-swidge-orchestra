@@ -197,7 +197,8 @@ export class OrchestraClient {
         const lines = buffer.split('\n')
         buffer = lines.pop() ?? ''
 
-        for (const line of lines) {
+        for (const rawLine of lines) {
+          const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
           if (line.startsWith('event:')) event = line.slice(6).trim()
           else if (line.startsWith('data:')) data += `${data ? '\n' : ''}${line.slice(5).trim()}`
           else if (line === '') {
@@ -206,6 +207,7 @@ export class OrchestraClient {
               callbacks.onStatus?.(parsed.status, parsed)
               if (isTerminalOrderStatus(parsed.status)) {
                 options.close()
+                await reader.cancel()
                 return
               }
             }

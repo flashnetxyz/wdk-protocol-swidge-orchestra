@@ -42,14 +42,15 @@ function jsonResponse (body, status = 200) {
   })
 }
 
-function sseResponse (events) {
+function sseResponse (events, options = {}) {
   const encoder = new TextEncoder()
+  const lineEnding = options.lineEnding ?? '\n'
   const stream = new ReadableStream({
     start (controller) {
       for (const event of events) {
-        controller.enqueue(encoder.encode(`event: status\ndata: ${JSON.stringify(event)}\n\n`))
+        controller.enqueue(encoder.encode(`event: status${lineEnding}data: ${JSON.stringify(event)}${lineEnding}${lineEnding}`))
       }
-      controller.close()
+      if (options.close !== false) controller.close()
     }
   })
 
@@ -69,6 +70,20 @@ function createFetch (responses) {
 
 function readJsonBody (call) {
   return JSON.parse(call[1].body)
+}
+
+async function waitWithTimeout (promise, ms, message) {
+  let timeout
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), ms)
+      })
+    ])
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 describe('Orchestra', () => {
@@ -303,14 +318,83 @@ describe('Orchestra', () => {
       fromTokenAmount: 1000n,
       recipient: 'TRecipient'
     })).rejects.toMatchObject({
-      name: 'OrchestraStateError',
+      name: 'OrchestraSubmitError',
+      state: {
+        sourceTxHash: 'spark_transfer_btc',
+        sourceNetworkFee: '11',
+        sourceChain: 'spark',
+        sourceAsset: 'BTC',
+        orderId: 'ord_123',
+        readToken: 'read_client_token'
+      },
       details: {
-        feeType: 'network',
-        feeBps: '110',
-        maxFeeBps: '100'
+        state: {
+          sourceTxHash: 'spark_transfer_btc',
+          sourceNetworkFee: '11',
+          sourceChain: 'spark',
+          sourceAsset: 'BTC',
+          orderId: 'ord_123',
+          readToken: 'read_client_token'
+        }
+      },
+      cause: {
+        name: 'OrchestraStateError',
+        details: {
+          feeType: 'network',
+          feeBps: '110',
+          maxFeeBps: '100'
+        }
       }
     })
 
+    expect(account.sendTransaction).toHaveBeenCalledTimes(1)
+    expect(readJsonBody(fetch.mock.calls[1]).sparkTxHash).toBe('spark_transfer_btc')
+  })
+
+  test('swidge rejects with recovery state when source network fee is unknown and capped', async () => {
+    account.sendTransaction.mockResolvedValueOnce({ hash: 'spark_transfer_btc' })
+    const fetch = createFetch([
+      { body: QUOTE },
+      { body: SUBMIT_CLIENT }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'spark',
+      maxNetworkFeeBps: 100,
+      idempotencyKeyFactory: () => ids.shift()
+    })
+
+    let thrown
+    try {
+      await protocol.swidge({
+        fromToken: 'BTC',
+        toToken: 'tron:USDT',
+        fromTokenAmount: 1000n,
+        recipient: 'TRecipient'
+      })
+    } catch (err) {
+      thrown = err
+    }
+
+    expect(thrown).toMatchObject({
+      name: 'OrchestraSubmitError',
+      state: {
+        sourceTxHash: 'spark_transfer_btc',
+        sourceChain: 'spark',
+        sourceAsset: 'BTC',
+        orderId: 'ord_123',
+        readToken: 'read_client_token'
+      },
+      cause: {
+        name: 'OrchestraStateError',
+        details: {
+          feeType: 'network',
+          maxFeeBps: '100'
+        }
+      }
+    })
+    expect(thrown.state).not.toHaveProperty('sourceNetworkFee')
     expect(account.sendTransaction).toHaveBeenCalledTimes(1)
     expect(readJsonBody(fetch.mock.calls[1]).sparkTxHash).toBe('spark_transfer_btc')
   })
@@ -757,7 +841,7 @@ describe('Orchestra', () => {
     const fetch = jest.fn(async () => sseResponse([
       { status: 'processing', order: { id: 'ord_123', status: 'processing' } },
       { status: 'completed', order: { id: 'ord_123', status: 'completed' } }
-    ]))
+    ], { lineEnding: '\r\n', close: false }))
     const protocol = new Orchestra(account, {
       apiKey: 'fn_client_key',
       authMode: 'client',
@@ -776,7 +860,7 @@ describe('Orchestra', () => {
       })
     })
 
-    await closed
+    await waitWithTimeout(closed, 1000, 'SSE subscription did not close on terminal CRLF frame')
     const url = new URL(String(fetch.mock.calls[0][0]))
 
     expect(statuses).toEqual(['processing', 'completed'])
@@ -894,6 +978,36 @@ describe('Orchestra', () => {
     expect(fetch.mock.calls[0][1].headers['X-Idempotency-Key']).toBe('submit-idem')
   })
 
+  test('submitSourceTx preserves unknown source network fee', async () => {
+    const fetch = createFetch([{ body: SUBMIT_CLIENT }])
+    const protocol = new Orchestra(undefined, {
+      apiKey: 'fn_client_key',
+      fetch
+    })
+
+    const state = await protocol.submitSourceTx({
+      ...QUOTE,
+      version: 1,
+      sourceChain: 'spark',
+      sourceAsset: 'BTC',
+      destinationChain: 'tron',
+      destinationAsset: 'USDT',
+      recipientAddress: 'TRecipient',
+      quoteIdempotencyKey: 'quote-idem',
+      submitIdempotencyKey: 'submit-idem',
+      sourceAddress: 'sp1sender',
+      createdAt: '2026-01-01T00:00:00.000Z'
+    }, 'spark_transfer_direct')
+
+    expect(state).not.toHaveProperty('sourceNetworkFee')
+    expect(state).toMatchObject({
+      sourceTxHash: 'spark_transfer_direct',
+      sourceAddress: 'sp1sender',
+      orderId: 'ord_123',
+      readToken: 'read_client_token'
+    })
+  })
+
   test('resumeSwap refuses to send a new source payment unless explicitly allowed', async () => {
     const fetch = createFetch([])
     const protocol = new Orchestra(account, {
@@ -979,6 +1093,47 @@ describe('Orchestra', () => {
       'source_payment_sent',
       'submitted'
     ])
+  })
+
+  test('executeSwapIntent preserves unknown source network fee in funded and submitted states', async () => {
+    const fetch = createFetch([
+      { body: QUOTE },
+      { body: SUBMIT_CLIENT }
+    ])
+    const events = []
+    const unknownFeeAccount = {
+      getAddress: jest.fn().mockResolvedValue('sp1sender'),
+      sendTransaction: jest.fn().mockResolvedValue({ hash: 'spark_transfer_btc' })
+    }
+    const protocol = new Orchestra(unknownFeeAccount, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'spark',
+      idempotencyKeyFactory: () => ids.shift(),
+      onStateChange: async (event, state) => {
+        JSON.stringify(state)
+        events.push({ event, state })
+      }
+    })
+    const intent = await protocol.prepareSwap({
+      tokenIn: 'BTC',
+      tokenOut: 'tron:USDT',
+      tokenInAmount: 1000n,
+      to: 'TRecipient'
+    })
+
+    const state = await protocol.executeSwapIntent(intent)
+    const funded = events.find(item => item.event === 'source_payment_sent')
+    const submitted = events.find(item => item.event === 'submitted')
+
+    expect(state).not.toHaveProperty('sourceNetworkFee')
+    expect(funded.state).not.toHaveProperty('sourceNetworkFee')
+    expect(submitted.state).not.toHaveProperty('sourceNetworkFee')
+    expect(state).toMatchObject({
+      sourceTxHash: 'spark_transfer_btc',
+      orderId: 'ord_123',
+      readToken: 'read_client_token'
+    })
   })
 
   test('executeSwapIntent submits Spark source address captured before broadcast', async () => {
