@@ -503,13 +503,28 @@ export default class Orchestra extends SwidgeProtocol {
 
   async submitSourceTx (intent, sourceTxHash, options = {}) {
     this._assertIntent(intent)
-    const submit = await this._submitTransfer(intent, sourceTxHash, options)
-    const state = normalizeSubmittedState(intent, {
+    const transfer = {
       sourceTxHash,
       sourceNetworkFee: options.sourceNetworkFee ?? intent.sourceNetworkFee,
       sourceAddress: options.sourceSparkAddress ?? options.sourceAddress ?? intent.sourceAddress,
       sourceTxVout: options.sourceTxVout ?? intent.sourceTxVout
-    }, submit)
+    }
+    const sourceNetworkFee = transfer.sourceNetworkFee ?? intent.sourceNetworkFee
+    const fundedState = {
+      ...intent,
+      sourceTxHash,
+      ...optionalStateAmount('sourceNetworkFee', sourceNetworkFee, 'sourceNetworkFee'),
+      sourceAddress: transfer.sourceAddress ?? intent.sourceAddress,
+      sourceTxVout: transfer.sourceTxVout ?? intent.sourceTxVout,
+      fundedAt: intent.fundedAt ?? nowIso()
+    }
+    let submit
+    try {
+      submit = await this._submitTransfer(fundedState, sourceTxHash, options)
+    } catch (err) {
+      throw new OrchestraSubmitError('Orchestra submit failed after the source payment was sent.', fundedState, err)
+    }
+    const state = normalizeSubmittedState(fundedState, transfer, submit)
     try {
       await this._emitState('submitted', state)
     } catch (err) {

@@ -923,7 +923,7 @@ describe('Orchestra', () => {
     expect(statuses).toEqual(['processing', 'completed'])
     expect(payloads[1].order.status).toBe('completed')
     expect(url.pathname).toBe('/v1/sse/operations/ord_123')
-    expect(url.searchParams.get('token')).toBe('fn_client_key')
+    expect(url.searchParams.get('token')).toBeNull()
     expect(url.searchParams.get('readToken')).toBe('read_client_token')
     expect(fetch.mock.calls[0][1].headers.Accept).toBe('text/event-stream')
     expect(fetch.mock.calls[0][1].headers.Authorization).toBe('Bearer fn_client_key')
@@ -1129,6 +1129,45 @@ describe('Orchestra', () => {
       sourceAddress: 'sp1sender',
       orderId: 'ord_123',
       readToken: 'read_client_token'
+    })
+  })
+
+  test('submitSourceTx failure exposes resumable source state', async () => {
+    const fetch = createFetch([
+      { status: 400, body: { error: { code: 'submit_failed', message: 'Submit failed.' } } }
+    ])
+    const protocol = new Orchestra(undefined, {
+      apiKey: 'fn_client_key',
+      fetch
+    })
+
+    await expect(protocol.submitSourceTx({
+      ...QUOTE,
+      version: 1,
+      sourceChain: 'spark',
+      sourceAsset: 'BTC',
+      destinationChain: 'tron',
+      destinationAsset: 'USDT',
+      recipientAddress: 'TRecipient',
+      quoteIdempotencyKey: 'quote-idem',
+      submitIdempotencyKey: 'submit-idem',
+      sourceAddress: 'sp1sender',
+      createdAt: '2026-01-01T00:00:00.000Z'
+    }, 'spark_transfer_direct', {
+      sourceNetworkFee: 3n
+    })).rejects.toMatchObject({
+      name: 'OrchestraSubmitError',
+      state: {
+        sourceTxHash: 'spark_transfer_direct',
+        sourceNetworkFee: '3',
+        sourceAddress: 'sp1sender',
+        quoteId: 'quo_123'
+      },
+      cause: {
+        name: 'OrchestraApiError',
+        code: 'submit_failed',
+        status: 400
+      }
     })
   })
 
@@ -1456,7 +1495,7 @@ describe('OrchestraClient', () => {
     expect(fetch.mock.calls[1][1].headers['X-Idempotency-Key']).toMatch(/^orchestra-|^[0-9a-f-]{36}$/)
   })
 
-  test('uses apiKey as an SSE URL token only for client or auto auth', async () => {
+  test('uses bearer auth without leaking the SSE token into the URL', async () => {
     const fetch = jest.fn()
     const defaultClient = new OrchestraClient({
       apiKey: 'fn_admin_key',

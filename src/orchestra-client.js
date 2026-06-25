@@ -170,15 +170,15 @@ export class OrchestraClient {
 
   async _runSse (orderId, callbacks, options) {
     const token = await this._resolveSseToken()
-    const query = { token }
+    const query = {}
     if (options.readToken) query.readToken = options.readToken
     const url = `${this._baseUrl}/v1/sse/operations/${encodeURIComponent(orderId)}${makeQuery(query)}`
+    const headers = await this._headers(options)
+    headers.Authorization = `Bearer ${token}`
+    headers.Accept = 'text/event-stream'
     const response = await this._fetch(url, {
       method: 'GET',
-      headers: {
-        ...await this._headers(options),
-        Accept: 'text/event-stream'
-      },
+      headers,
       signal: options.signal
     })
 
