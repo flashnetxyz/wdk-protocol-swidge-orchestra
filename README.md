@@ -631,7 +631,7 @@ npm pack --dry-run
 
 ## Support
 
-Use [GitHub Issues](https://github.com/flashnetxyz/orchestra-wdk/issues) for package support. Partner integrations can also use their existing Flashnet partner channel.
+For package support, reach out to info@flashnet.xyz.
 
 ## Security
 
