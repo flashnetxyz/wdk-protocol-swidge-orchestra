@@ -310,7 +310,11 @@ export default class Orchestra extends SwidgeProtocol {
       ...optionalObject('transactions', transactions),
       fromTokenAmount: toBigIntAmount(submitted.amountIn, 'amountIn'),
       toTokenAmount: toBigIntAmount(submitted.estimatedOut, 'estimatedOut'),
-      toTokenAmountMin: toBigIntAmount(submitted.estimatedOut, 'estimatedOut')
+      toTokenAmountMin: this._minimumToTokenAmount(submitted, {
+        amountMode: submitted.amountMode,
+        amount: submitted.estimatedOut,
+        slippageBps: submitted.slippageBps
+      })
     }
   }
 
@@ -431,6 +435,11 @@ export default class Orchestra extends SwidgeProtocol {
       amountMode: quote.amountMode ?? params.amountMode,
       amountIn: quote.amountIn,
       estimatedOut: quote.estimatedOut,
+      ...optionalObject('minAmountOut', quote.minAmountOut),
+      ...optionalObject('minimumOut', quote.minimumOut),
+      ...optionalObject('minOut', quote.minOut),
+      ...optionalObject('guaranteedOut', quote.guaranteedOut),
+      ...optionalObject('slippageBps', params.slippageBps),
       depositAddress: quote.depositAddress,
       feeAmount: quote.feeAmount,
       totalFeeAmount: quote.totalFeeAmount,
@@ -495,12 +504,18 @@ export default class Orchestra extends SwidgeProtocol {
   async submitSourceTx (intent, sourceTxHash, options = {}) {
     this._assertIntent(intent)
     const submit = await this._submitTransfer(intent, sourceTxHash, options)
-    return normalizeSubmittedState(intent, {
+    const state = normalizeSubmittedState(intent, {
       sourceTxHash,
       sourceNetworkFee: options.sourceNetworkFee ?? intent.sourceNetworkFee,
       sourceAddress: options.sourceSparkAddress ?? options.sourceAddress ?? intent.sourceAddress,
       sourceTxVout: options.sourceTxVout ?? intent.sourceTxVout
     }, submit)
+    try {
+      await this._emitState('submitted', state)
+    } catch (err) {
+      throw new OrchestraSubmitError('State persistence failed after Orchestra accepted the source payment.', state, err)
+    }
+    return state
   }
 
   async _resolveSourceTransfer (intent, options) {
@@ -1113,6 +1128,11 @@ export default class Orchestra extends SwidgeProtocol {
  * @property {'exact_in' | 'exact_out'} amountMode
  * @property {string} amountIn
  * @property {string} estimatedOut
+ * @property {string} [minAmountOut]
+ * @property {string} [minimumOut]
+ * @property {string} [minOut]
+ * @property {string} [guaranteedOut]
+ * @property {number} [slippageBps]
  * @property {string} depositAddress
  * @property {string} expiresAt
  * @property {string} [sourceTokenAddress]

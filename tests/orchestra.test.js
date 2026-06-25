@@ -216,7 +216,8 @@ describe('Orchestra', () => {
       fromToken: 'BTC',
       toToken: 'tron:USDT',
       fromTokenAmount: 1000n,
-      recipient: 'TRecipient'
+      recipient: 'TRecipient',
+      slippage: 0.01
     })
 
     expect(result).toEqual({
@@ -242,8 +243,33 @@ describe('Orchestra', () => {
       transactions: [{ hash: 'spark_transfer_btc', chain: 'spark', type: 'source' }],
       fromTokenAmount: 1000n,
       toTokenAmount: 990000n,
-      toTokenAmountMin: 990000n
+      toTokenAmountMin: 980100n
     })
+  })
+
+  test('swidge returns Orchestra minimum output when provided', async () => {
+    account.sendTransaction.mockResolvedValueOnce({ hash: 'spark_transfer_btc', fee: 2n })
+    const fetch = createFetch([
+      { body: { ...QUOTE, minAmountOut: '970000' } },
+      { body: SUBMIT_CLIENT }
+    ])
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      fetch,
+      sourceChain: 'spark',
+      idempotencyKeyFactory: () => ids.shift()
+    })
+
+    const result = await protocol.swidge({
+      fromToken: 'BTC',
+      toToken: 'tron:USDT',
+      fromTokenAmount: 1000n,
+      recipient: 'TRecipient',
+      slippage: 0.01
+    })
+
+    expect(result.toTokenAmount).toBe(990000n)
+    expect(result.toTokenAmountMin).toBe(970000n)
   })
 
   test('swidge throws with read-only and undefined accounts', async () => {
@@ -875,7 +901,8 @@ describe('Orchestra', () => {
     const protocol = new Orchestra(account, {
       apiKey: 'fn_client_key',
       authMode: 'client',
-      fetch
+      fetch,
+      getAuthHeaders: () => ({ 'X-Proxy-Auth': 'proxy-token' })
     })
     const statuses = []
     const payloads = []
@@ -898,6 +925,39 @@ describe('Orchestra', () => {
     expect(url.pathname).toBe('/v1/sse/operations/ord_123')
     expect(url.searchParams.get('token')).toBe('fn_client_key')
     expect(url.searchParams.get('readToken')).toBe('read_client_token')
+    expect(fetch.mock.calls[0][1].headers.Accept).toBe('text/event-stream')
+    expect(fetch.mock.calls[0][1].headers.Authorization).toBe('Bearer fn_client_key')
+    expect(fetch.mock.calls[0][1].headers['X-Read-Token']).toBe('read_client_token')
+    expect(fetch.mock.calls[0][1].headers['X-Proxy-Auth']).toBe('proxy-token')
+  })
+
+  test('subscribeOrder reports an error when SSE closes before terminal status', async () => {
+    const fetch = jest.fn(async () => sseResponse([
+      { status: 'processing', order: { id: 'ord_123', status: 'processing' } }
+    ]))
+    const protocol = new Orchestra(account, {
+      apiKey: 'fn_client_key',
+      authMode: 'client',
+      fetch
+    })
+    const statuses = []
+    const events = []
+    const failed = new Promise(resolve => {
+      protocol.subscribeOrder({ orderId: 'ord_123' }, {
+        onStatus: status => statuses.push(status),
+        onError: resolve,
+        onClose: () => events.push('close')
+      })
+    })
+
+    const err = await waitWithTimeout(failed, 1000, 'SSE subscription did not error on early close')
+
+    expect(statuses).toEqual(['processing'])
+    expect(err).toMatchObject({
+      name: 'OrchestraApiError',
+      code: 'sse_connection_closed'
+    })
+    expect(events).toEqual(['close'])
   })
 
   test('subscribeOrder rejects successful non-SSE responses', async () => {
@@ -993,9 +1053,13 @@ describe('Orchestra', () => {
 
   test('submitSourceTx submits an existing source transaction directly', async () => {
     const fetch = createFetch([{ body: SUBMIT_CLIENT }])
+    const events = []
     const protocol = new Orchestra(undefined, {
       apiKey: 'fn_client_key',
-      fetch
+      fetch,
+      onStateChange: async (event, state) => {
+        events.push({ event, state })
+      }
     })
 
     const state = await protocol.submitSourceTx({
@@ -1026,6 +1090,15 @@ describe('Orchestra', () => {
       sparkTxHash: 'spark_transfer_direct',
       sourceSparkAddress: 'sp1sender'
     })
+    expect(events).toEqual([{
+      event: 'submitted',
+      state: expect.objectContaining({
+        sourceTxHash: 'spark_transfer_direct',
+        sourceNetworkFee: '3',
+        orderId: 'ord_123',
+        readToken: 'read_client_token'
+      })
+    }])
     expect(fetch.mock.calls[0][1].headers['X-Idempotency-Key']).toBe('submit-idem')
   })
 

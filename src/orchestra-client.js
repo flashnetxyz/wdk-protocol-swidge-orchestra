@@ -175,7 +175,10 @@ export class OrchestraClient {
     const url = `${this._baseUrl}/v1/sse/operations/${encodeURIComponent(orderId)}${makeQuery(query)}`
     const response = await this._fetch(url, {
       method: 'GET',
-      headers: { Accept: 'text/event-stream' },
+      headers: {
+        ...await this._headers(options),
+        Accept: 'text/event-stream'
+      },
       signal: options.signal
     })
 
@@ -193,7 +196,9 @@ export class OrchestraClient {
     try {
       while (!options.signal.aborted) {
         const { done, value } = await reader.read()
-        if (done) return
+        if (done) {
+          throw new OrchestraApiError('sse_connection_closed', 'SSE connection closed before a terminal order status.', 0)
+        }
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
         buffer = lines.pop() ?? ''
