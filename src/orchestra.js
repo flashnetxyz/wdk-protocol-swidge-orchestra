@@ -137,6 +137,14 @@ function slippageToBps (slippage) {
   return Math.round(slippage * 10_000)
 }
 
+function applySlippageBps (amount, slippageBps) {
+  if (slippageBps === undefined || slippageBps === null) return amount
+  if (!Number.isInteger(slippageBps) || slippageBps < 0 || slippageBps > 10_000) {
+    throw new OrchestraStateError('slippageBps must be an integer between 0 and 10000.')
+  }
+  return (amount * BigInt(10_000 - slippageBps)) / 10_000n
+}
+
 function normalizeSubmittedState (intent, transfer, submit) {
   return {
     ...intent,
@@ -580,14 +588,14 @@ export default class Orchestra extends SwidgeProtocol {
 
   _minimumToTokenAmount (quote, params) {
     if (params.amountMode === 'exact_out') return toBigIntAmount(params.amount, 'toTokenAmount')
-    return toBigIntAmount(
-      quote.minAmountOut ??
+    const quotedMinimum = quote.minAmountOut ??
       quote.minimumOut ??
       quote.minOut ??
-      quote.guaranteedOut ??
-      quote.estimatedOut,
-      'toTokenAmountMin'
-    )
+      quote.guaranteedOut
+    if (quotedMinimum !== undefined && quotedMinimum !== null) {
+      return toBigIntAmount(quotedMinimum, 'toTokenAmountMin')
+    }
+    return applySlippageBps(toBigIntAmount(quote.estimatedOut, 'estimatedOut'), params.slippageBps)
   }
 
   _quoteFees (quote, params) {
@@ -677,9 +685,11 @@ export default class Orchestra extends SwidgeProtocol {
     const sourceHash = order.sourceTxHash ?? order.txHash ?? order.depositTxHash ?? status.sourceTxHash
     const destinationHash = order.destinationTxHash ?? order.payoutTxHash ?? order.withdrawTxHash ?? status.destinationTxHash
     const refundHash = order.refundTxHash ?? status.refundTxHash
-    if (sourceHash) transactions.push({ hash: sourceHash, chain: options.fromChain, type: 'source' })
-    if (destinationHash) transactions.push({ hash: destinationHash, chain: options.toChain, type: 'destination' })
-    if (refundHash) transactions.push({ hash: refundHash, chain: options.fromChain, type: 'refund' })
+    const sourceChain = options.fromChain ?? order.sourceChain
+    const destinationChain = options.toChain ?? order.destinationChain
+    if (sourceHash) transactions.push({ hash: sourceHash, ...optionalObject('chain', sourceChain), type: 'source' })
+    if (destinationHash) transactions.push({ hash: destinationHash, ...optionalObject('chain', destinationChain), type: 'destination' })
+    if (refundHash) transactions.push({ hash: refundHash, ...optionalObject('chain', sourceChain), type: 'refund' })
     return transactions
   }
 
@@ -912,13 +922,17 @@ export default class Orchestra extends SwidgeProtocol {
 
   async _submitBody (intent, sourceTxHash, options) {
     if (intent.sourceChain === 'spark') {
+      const sourceSparkAddress = options.sourceSparkAddress ??
+        options.sourceAddress ??
+        intent.sourceAddress ??
+        await this._account?.getAddress?.()
+      if (!sourceSparkAddress) {
+        throw new OrchestraStateError('Spark submit requires sourceSparkAddress, sourceAddress, intent.sourceAddress, or an account with getAddress().')
+      }
       return {
         quoteId: intent.quoteId,
         sparkTxHash: sourceTxHash,
-        sourceSparkAddress: options.sourceSparkAddress ??
-          options.sourceAddress ??
-          intent.sourceAddress ??
-          await this._account.getAddress()
+        sourceSparkAddress
       }
     }
     if (intent.sourceChain === 'bitcoin') {

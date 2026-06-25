@@ -78,6 +78,13 @@ function retryDelayMs (attempt, baseDelayMs, response) {
   return exponential + Math.floor(Math.random() * Math.min(100, exponential))
 }
 
+function retryCount (value, field) {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${field} must be a non-negative integer.`)
+  }
+  return value
+}
+
 export function isTerminalOrderStatus (status) {
   return status === 'completed' ||
     status === 'failed' ||
@@ -93,9 +100,9 @@ export class OrchestraClient {
     this._fetch = config.fetch ?? globalThis.fetch
     this._getAuthHeaders = config.getAuthHeaders
     this._timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS
-    this._maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES
+    this._maxRetries = retryCount(config.maxRetries ?? DEFAULT_MAX_RETRIES, 'maxRetries')
     this._retryDelayMs = config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS
-    this._submitMaxRetries = config.submitMaxRetries ?? Math.max(this._maxRetries, 6)
+    this._submitMaxRetries = retryCount(config.submitMaxRetries ?? Math.max(this._maxRetries, 6), 'submitMaxRetries')
     this._submitRetryDelayMs = config.submitRetryDelayMs ?? this._retryDelayMs
     this._sseToken = config.sseToken
     this._getSseToken = config.getSseToken
@@ -153,7 +160,7 @@ export class OrchestraClient {
       ...options,
       signal: controller.signal,
       close
-    }).catch(err => {
+    }).then(close, err => {
       if (!closed) callbacks.onError?.(err)
       close()
     })
@@ -214,7 +221,7 @@ export class OrchestraClient {
 
   async _requestJson (method, path, options = {}) {
     let lastError
-    const maxRetries = options.maxRetries ?? this._maxRetries
+    const maxRetries = retryCount(options.maxRetries ?? this._maxRetries, 'maxRetries')
     const retryDelay = options.retryDelayMs ?? this._retryDelayMs
     const retryErrorCodes = options.retryErrorCodes ?? new Set()
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {

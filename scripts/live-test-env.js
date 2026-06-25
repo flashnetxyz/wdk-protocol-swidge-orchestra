@@ -197,12 +197,17 @@ function makeWdk (env) {
 
 async function accounts (env) {
   const wdk = makeWdk(env)
-  const [bitcoin, spark, arbitrum] = await Promise.all([
-    wdk.getAccount('bitcoin', 0),
-    wdk.getAccount('spark', 0),
-    wdk.getAccount('arbitrum', 0)
-  ])
-  return { wdk, bitcoin, spark, arbitrum }
+  try {
+    const [bitcoin, spark, arbitrum] = await Promise.all([
+      wdk.getAccount('bitcoin', 0),
+      wdk.getAccount('spark', 0),
+      wdk.getAccount('arbitrum', 0)
+    ])
+    return { wdk, bitcoin, spark, arbitrum }
+  } catch (err) {
+    wdk.dispose()
+    throw err
+  }
 }
 
 function protocolConfig (env, sourceChain, onStateChange) {
@@ -224,17 +229,22 @@ function protocolConfig (env, sourceChain, onStateChange) {
 async function swapContext (env, directionName, onStateChange, recipientAddress) {
   const direction = directionConfig(directionName)
   const wdk = makeWdk(env)
-  const sourceAccount = await wdk.getAccount(direction.sourceWallet, 0)
-  const destinationAddress = recipientAddress ?? await (await wdk.getAccount(direction.destinationWallet, 0)).getAddress()
-  return {
-    wdk,
-    protocol: new Orchestra(sourceAccount, protocolConfig(env, direction.sourceChain, onStateChange)),
-    direction,
-    options: {
-      fromToken: `${direction.sourceChain}:${direction.sourceAsset}`,
-      toToken: `${direction.destinationChain}:${direction.destinationAsset}`,
-      recipient: destinationAddress
+  try {
+    const sourceAccount = await wdk.getAccount(direction.sourceWallet, 0)
+    const destinationAddress = recipientAddress ?? await (await wdk.getAccount(direction.destinationWallet, 0)).getAddress()
+    return {
+      wdk,
+      protocol: new Orchestra(sourceAccount, protocolConfig(env, direction.sourceChain, onStateChange)),
+      direction,
+      options: {
+        fromToken: `${direction.sourceChain}:${direction.sourceAsset}`,
+        toToken: `${direction.destinationChain}:${direction.destinationAsset}`,
+        recipient: destinationAddress
+      }
     }
+  } catch (err) {
+    wdk.dispose()
+    throw err
   }
 }
 

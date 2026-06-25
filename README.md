@@ -1,8 +1,8 @@
-# @flashnet/orchestra-wdk
+# wdk-protocol-swidge-orchestra
 
 ![Powered by WDK](https://img.shields.io/badge/Powered%20by-WDK-111111)
 
-`@flashnet/orchestra-wdk` is a WDK `SwidgeProtocol` for moving between BTC on Spark, Bitcoin L1, or Lightning and USDT on Ethereum, Tron, Arbitrum, Solana, BSC, Optimism, Plasma, Polygon, TON, and every route returned by Orchestra.
+`wdk-protocol-swidge-orchestra` is a WDK `SwidgeProtocol` for moving between BTC on Spark, Bitcoin L1, or Lightning and USDT on Ethereum, Tron, Arbitrum, Solana, BSC, Optimism, Plasma, Polygon, TON, and every route returned by Orchestra.
 
 WDK owns wallet accounts, key material, and transaction signing. Orchestra owns quote routing, deposit addresses, order state, and settlement. The host wallet owns durable local or backend persistence.
 
@@ -50,18 +50,18 @@ Use discovery for wallet UI. Use the route matrix when you need the exact source
 ## Install
 
 ```bash
-npm install @flashnet/orchestra-wdk @tetherto/wdk-wallet@1.0.0-beta.9
+npm install wdk-protocol-swidge-orchestra @tetherto/wdk-wallet@1.0.0-beta.11
 ```
 
 Install the WDK wallet packages for the chains you support:
 
 ```bash
-npm install @tetherto/wdk @tetherto/wdk-wallet-spark @tetherto/wdk-wallet-btc @tetherto/wdk-wallet-evm
+npm install @tetherto/wdk@1.0.0-beta.12 @tetherto/wdk-wallet-spark@1.0.0-beta.21 @tetherto/wdk-wallet-btc@1.0.0-beta.10 @tetherto/wdk-wallet-evm@1.0.0-beta.14
 ```
 
 ## WDK Interface
 
-`Orchestra` extends `SwidgeProtocol` from `@tetherto/wdk-wallet@1.0.0-beta.9`.
+`Orchestra` extends `SwidgeProtocol` from `@tetherto/wdk-wallet@1.0.0-beta.11`.
 
 Implemented methods:
 
@@ -84,7 +84,7 @@ import WDK from "@tetherto/wdk"
 import WalletManagerBtc from "@tetherto/wdk-wallet-btc"
 import WalletManagerEvm from "@tetherto/wdk-wallet-evm"
 import WalletManagerSpark from "@tetherto/wdk-wallet-spark"
-import Orchestra from "@flashnet/orchestra-wdk"
+import Orchestra from "wdk-protocol-swidge-orchestra"
 
 const wdk = new WDK(seedPhrase)
   .registerWallet("spark", WalletManagerSpark, {
@@ -469,6 +469,18 @@ try {
 }
 ```
 
+## Error Types
+
+All package-specific errors extend `OrchestraError`.
+
+| Error | When it is thrown | Useful fields |
+| --- | --- | --- |
+| `OrchestraError` | Base class for package-specific failures. | `code`, `details` |
+| `OrchestraApiError` | Orchestra returns an API error or an invalid API response. | `code`, `status`, `details` |
+| `OrchestraStateError` | Input state is incomplete, unsafe to resume, expired, or not compatible with the requested source payment. | `code`, `details` |
+| `OrchestraSubmitError` | The source payment was sent, but submit or post-submit state persistence failed. Persist `state` before retrying. | `state`, `cause` |
+| `OrchestraTimeoutError` | An HTTP request or wait operation exceeds its timeout. | `code`, `details` |
+
 ## Status Mapping
 
 `getSwidgeStatus()` maps Orchestra order status into the WDK Swidge status enum.
@@ -617,9 +629,13 @@ npm run build:types
 npm pack --dry-run
 ```
 
+## Support
+
+Use [GitHub Issues](https://github.com/flashnetxyz/orchestra-wdk/issues) for package support. Partner integrations can also use their existing Flashnet partner channel.
+
 ## Security
 
-See [SECURITY.md](./SECURITY.md).
+Report vulnerabilities through [GitHub Security Advisories](https://github.com/flashnetxyz/orchestra-wdk/security/advisories/new). Do not open a public issue for a vulnerability. See [SECURITY.md](./SECURITY.md).
 
 ## License
 
