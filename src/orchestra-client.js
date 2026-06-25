@@ -179,7 +179,8 @@ export class OrchestraClient {
       signal: options.signal
     })
 
-    if (!response.ok || !response.body) {
+    const contentType = (response.headers.get('content-type') ?? '').toLowerCase()
+    if (!response.ok || !response.body || !contentType.includes('text/event-stream')) {
       throw new OrchestraApiError('sse_connection_failed', `SSE connection failed: HTTP ${response.status}`, response.status)
     }
 
@@ -280,10 +281,10 @@ export class OrchestraClient {
         0
       )
     }
-    if (this._authMode !== 'client') {
+    if (this._authMode !== 'client' && this._authMode !== 'auto') {
       throw new OrchestraApiError(
         'sse_token_required',
-        "SSE requires sseToken/getSseToken unless authMode is explicitly set to 'client'.",
+        "SSE requires sseToken/getSseToken unless authMode is explicitly set to 'client' or 'auto'.",
         0
       )
     }

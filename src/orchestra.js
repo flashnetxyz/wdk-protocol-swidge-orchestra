@@ -460,6 +460,9 @@ export default class Orchestra extends SwidgeProtocol {
    */
   async executeSwapIntent (intent, options = {}) {
     this._assertIntent(intent)
+    if (!options.sourceTxHash && !intent.sourceTxHash) {
+      this._assertWritableAccount()
+    }
     const transfer = await this._resolveSourceTransfer(intent, options)
     const sourceNetworkFee = transfer.sourceNetworkFee ?? intent.sourceNetworkFee
 

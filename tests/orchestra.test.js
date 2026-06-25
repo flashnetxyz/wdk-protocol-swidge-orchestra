@@ -270,6 +270,36 @@ describe('Orchestra', () => {
     expect(fetch).not.toHaveBeenCalled()
   })
 
+  test('executeSwapIntent throws before fresh source payment without a writable account', async () => {
+    const fetch = createFetch([])
+    const readOnlyProtocol = new Orchestra({
+      getAddress: jest.fn().mockResolvedValue('sp1sender')
+    }, {
+      fetch,
+      sourceChain: 'spark'
+    })
+    const accountlessProtocol = new Orchestra(undefined, {
+      fetch,
+      sourceChain: 'spark'
+    })
+    const intent = {
+      ...QUOTE,
+      version: 1,
+      sourceChain: 'spark',
+      sourceAsset: 'BTC',
+      destinationChain: 'tron',
+      destinationAsset: 'USDT',
+      recipientAddress: 'TRecipient',
+      quoteIdempotencyKey: 'quote-idem',
+      submitIdempotencyKey: 'submit-idem',
+      createdAt: '2026-01-01T00:00:00.000Z'
+    }
+
+    await expect(readOnlyProtocol.executeSwapIntent(intent)).rejects.toBeInstanceOf(OrchestraStateError)
+    await expect(accountlessProtocol.executeSwapIntent(intent)).rejects.toBeInstanceOf(OrchestraStateError)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
   test('swidge rejects when protocol fees exceed maxProtocolFeeBps', async () => {
     const fetch = createFetch([{ body: QUOTE }])
     const protocol = new Orchestra(account, {
@@ -870,6 +900,27 @@ describe('Orchestra', () => {
     expect(url.searchParams.get('readToken')).toBe('read_client_token')
   })
 
+  test('subscribeOrder rejects successful non-SSE responses', async () => {
+    const fetch = jest.fn(async () => jsonResponse({ error: 'not an event stream' }))
+    const client = new OrchestraClient({
+      apiKey: 'fn_client_key',
+      authMode: 'client',
+      fetch
+    })
+    const controller = new AbortController()
+
+    await expect(client._runSse('ord_123', {
+      onStatus: jest.fn()
+    }, {
+      signal: controller.signal,
+      close: jest.fn()
+    })).rejects.toMatchObject({
+      name: 'OrchestraApiError',
+      code: 'sse_connection_failed',
+      status: 200
+    })
+  })
+
   test('getSupportedChains and getSupportedTokens read the Orchestra route matrix', async () => {
     const fetch = createFetch([
       { body: ROUTES },
@@ -1332,7 +1383,7 @@ describe('OrchestraClient', () => {
     expect(fetch.mock.calls[1][1].headers['X-Idempotency-Key']).toMatch(/^orchestra-|^[0-9a-f-]{36}$/)
   })
 
-  test('does not use apiKey as an SSE URL token unless client auth is explicit', async () => {
+  test('uses apiKey as an SSE URL token only for client or auto auth', async () => {
     const fetch = jest.fn()
     const defaultClient = new OrchestraClient({
       apiKey: 'fn_admin_key',
@@ -1343,8 +1394,14 @@ describe('OrchestraClient', () => {
       authMode: 'client',
       fetch
     })
+    const autoClient = new OrchestraClient({
+      apiKey: 'client_key_for_auto_mode',
+      authMode: 'auto',
+      fetch
+    })
 
     await expect(defaultClient._resolveSseToken()).rejects.toMatchObject({ code: 'sse_token_required' })
     await expect(scopedClient._resolveSseToken()).resolves.toBe('client_key_for_test')
+    await expect(autoClient._resolveSseToken()).resolves.toBe('client_key_for_auto_mode')
   })
 })
