@@ -117,7 +117,11 @@ function readToken (target) {
 }
 
 function stateAmount (amount, field) {
-  return toBigIntAmount(amount ?? 0n, field).toString()
+  return toBigIntAmount(amount, field).toString()
+}
+
+function optionalStateAmount (key, amount, field) {
+  return amount === undefined || amount === null ? {} : { [key]: stateAmount(amount, field) }
 }
 
 function unixSeconds (iso) {
@@ -137,11 +141,20 @@ function slippageToBps (slippage) {
   return Math.round(slippage * 10_000)
 }
 
+function applySlippageBps (amount, slippageBps) {
+  if (slippageBps === undefined || slippageBps === null) return amount
+  if (!Number.isInteger(slippageBps) || slippageBps < 0 || slippageBps > 10_000) {
+    throw new OrchestraStateError('slippageBps must be an integer between 0 and 10000.')
+  }
+  return (amount * BigInt(10_000 - slippageBps)) / 10_000n
+}
+
 function normalizeSubmittedState (intent, transfer, submit) {
+  const sourceNetworkFee = transfer.sourceNetworkFee ?? intent.sourceNetworkFee
   return {
     ...intent,
     sourceTxHash: transfer.sourceTxHash,
-    sourceNetworkFee: stateAmount(transfer.sourceNetworkFee ?? intent.sourceNetworkFee, 'sourceNetworkFee'),
+    ...optionalStateAmount('sourceNetworkFee', sourceNetworkFee, 'sourceNetworkFee'),
     sourceAddress: transfer.sourceAddress ?? intent.sourceAddress,
     sourceTxVout: transfer.sourceTxVout ?? intent.sourceTxVout,
     orderId: submit.orderId,
@@ -278,8 +291,15 @@ export default class Orchestra extends SwidgeProtocol {
     })
     this._enforceFeeLimits(this._intentFees(intent), toBigIntAmount(intent.amountIn, 'amountIn'), mergedConfig)
     const submitted = await this.executeSwapIntent(intent, { ...options, ...config })
-    const fees = this._stateFees(submitted)
-    this._enforceFeeLimits(fees, toBigIntAmount(submitted.amountIn, 'amountIn'), mergedConfig)
+    let fees
+    try {
+      fees = this._stateFees(submitted)
+      this._enforceFeeLimits(fees, toBigIntAmount(submitted.amountIn, 'amountIn'), mergedConfig, {
+        requireNetworkFee: true
+      })
+    } catch (err) {
+      throw new OrchestraSubmitError('Post-submit validation failed after Orchestra accepted the source payment.', submitted, err)
+    }
     const transactions = submitted.sourceTxHash
       ? [{ hash: submitted.sourceTxHash, chain: submitted.sourceChain, type: 'source' }]
       : undefined
@@ -290,7 +310,11 @@ export default class Orchestra extends SwidgeProtocol {
       ...optionalObject('transactions', transactions),
       fromTokenAmount: toBigIntAmount(submitted.amountIn, 'amountIn'),
       toTokenAmount: toBigIntAmount(submitted.estimatedOut, 'estimatedOut'),
-      toTokenAmountMin: toBigIntAmount(submitted.estimatedOut, 'estimatedOut')
+      toTokenAmountMin: this._minimumToTokenAmount(submitted, {
+        amountMode: submitted.amountMode,
+        amount: submitted.estimatedOut,
+        slippageBps: submitted.slippageBps
+      })
     }
   }
 
@@ -411,6 +435,11 @@ export default class Orchestra extends SwidgeProtocol {
       amountMode: quote.amountMode ?? params.amountMode,
       amountIn: quote.amountIn,
       estimatedOut: quote.estimatedOut,
+      ...optionalObject('minAmountOut', quote.minAmountOut),
+      ...optionalObject('minimumOut', quote.minimumOut),
+      ...optionalObject('minOut', quote.minOut),
+      ...optionalObject('guaranteedOut', quote.guaranteedOut),
+      ...optionalObject('slippageBps', params.slippageBps),
       depositAddress: quote.depositAddress,
       feeAmount: quote.feeAmount,
       totalFeeAmount: quote.totalFeeAmount,
@@ -440,12 +469,16 @@ export default class Orchestra extends SwidgeProtocol {
    */
   async executeSwapIntent (intent, options = {}) {
     this._assertIntent(intent)
+    if (!options.sourceTxHash && !intent.sourceTxHash) {
+      this._assertWritableAccount()
+    }
     const transfer = await this._resolveSourceTransfer(intent, options)
+    const sourceNetworkFee = transfer.sourceNetworkFee ?? intent.sourceNetworkFee
 
     const fundedState = {
       ...intent,
       sourceTxHash: transfer.sourceTxHash,
-      sourceNetworkFee: stateAmount(transfer.sourceNetworkFee ?? intent.sourceNetworkFee, 'sourceNetworkFee'),
+      ...optionalStateAmount('sourceNetworkFee', sourceNetworkFee, 'sourceNetworkFee'),
       sourceAddress: transfer.sourceAddress ?? intent.sourceAddress,
       sourceTxVout: transfer.sourceTxVout ?? intent.sourceTxVout,
       sourcePaymentStartedAt: transfer.sourcePaymentStartedAt ?? intent.sourcePaymentStartedAt,
@@ -470,20 +503,41 @@ export default class Orchestra extends SwidgeProtocol {
 
   async submitSourceTx (intent, sourceTxHash, options = {}) {
     this._assertIntent(intent)
-    const submit = await this._submitTransfer(intent, sourceTxHash, options)
-    return normalizeSubmittedState(intent, {
+    const transfer = {
       sourceTxHash,
-      sourceNetworkFee: options.sourceNetworkFee ?? intent.sourceNetworkFee ?? 0n,
+      sourceNetworkFee: options.sourceNetworkFee ?? intent.sourceNetworkFee,
       sourceAddress: options.sourceSparkAddress ?? options.sourceAddress ?? intent.sourceAddress,
       sourceTxVout: options.sourceTxVout ?? intent.sourceTxVout
-    }, submit)
+    }
+    const sourceNetworkFee = transfer.sourceNetworkFee ?? intent.sourceNetworkFee
+    const fundedState = {
+      ...intent,
+      sourceTxHash,
+      ...optionalStateAmount('sourceNetworkFee', sourceNetworkFee, 'sourceNetworkFee'),
+      sourceAddress: transfer.sourceAddress ?? intent.sourceAddress,
+      sourceTxVout: transfer.sourceTxVout ?? intent.sourceTxVout,
+      fundedAt: intent.fundedAt ?? nowIso()
+    }
+    let submit
+    try {
+      submit = await this._submitTransfer(fundedState, sourceTxHash, options)
+    } catch (err) {
+      throw new OrchestraSubmitError('Orchestra submit failed after the source payment was sent.', fundedState, err)
+    }
+    const state = normalizeSubmittedState(fundedState, transfer, submit)
+    try {
+      await this._emitState('submitted', state)
+    } catch (err) {
+      throw new OrchestraSubmitError('State persistence failed after Orchestra accepted the source payment.', state, err)
+    }
+    return state
   }
 
   async _resolveSourceTransfer (intent, options) {
     if (options.sourceTxHash) {
       return {
         sourceTxHash: options.sourceTxHash,
-        sourceNetworkFee: options.sourceNetworkFee ?? 0n,
+        sourceNetworkFee: options.sourceNetworkFee,
         sourceAddress: options.sourceSparkAddress ?? options.sourceAddress,
         sourceTxVout: options.sourceTxVout
       }
@@ -491,7 +545,7 @@ export default class Orchestra extends SwidgeProtocol {
     if (intent.sourceTxHash) {
       return {
         sourceTxHash: intent.sourceTxHash,
-        sourceNetworkFee: intent.sourceNetworkFee ?? 0n,
+        sourceNetworkFee: intent.sourceNetworkFee,
         sourceAddress: intent.sourceAddress,
         sourceTxVout: intent.sourceTxVout
       }
@@ -580,14 +634,14 @@ export default class Orchestra extends SwidgeProtocol {
 
   _minimumToTokenAmount (quote, params) {
     if (params.amountMode === 'exact_out') return toBigIntAmount(params.amount, 'toTokenAmount')
-    return toBigIntAmount(
-      quote.minAmountOut ??
+    const quotedMinimum = quote.minAmountOut ??
       quote.minimumOut ??
       quote.minOut ??
-      quote.guaranteedOut ??
-      quote.estimatedOut,
-      'toTokenAmountMin'
-    )
+      quote.guaranteedOut
+    if (quotedMinimum !== undefined && quotedMinimum !== null) {
+      return toBigIntAmount(quotedMinimum, 'toTokenAmountMin')
+    }
+    return applySlippageBps(toBigIntAmount(quote.estimatedOut, 'estimatedOut'), params.slippageBps)
   }
 
   _quoteFees (quote, params) {
@@ -611,22 +665,32 @@ export default class Orchestra extends SwidgeProtocol {
   }
 
   _stateFees (state) {
+    const sourceFee = state.sourceNetworkFee === undefined || state.sourceNetworkFee === null
+      ? []
+      : [{
+          type: 'network',
+          amount: toBigIntAmount(state.sourceNetworkFee, 'sourceNetworkFee'),
+          token: CHAIN_METADATA[state.sourceChain]?.nativeToken ?? state.sourceAsset,
+          chain: state.sourceChain,
+          included: false,
+          description: 'Source wallet network fee'
+        }]
     return [
-      {
-        type: 'network',
-        amount: toBigIntAmount(state.sourceNetworkFee ?? 0n, 'sourceNetworkFee'),
-        token: CHAIN_METADATA[state.sourceChain]?.nativeToken ?? state.sourceAsset,
-        chain: state.sourceChain,
-        included: false,
-        description: 'Source wallet network fee'
-      },
+      ...sourceFee,
       ...this._intentFees(state)
     ]
   }
 
-  _enforceFeeLimits (fees, inputAmount, config) {
+  _enforceFeeLimits (fees, inputAmount, config, options = {}) {
+    const networkFees = fees.filter(fee => fee.type === 'network')
+    if (options.requireNetworkFee && config.maxNetworkFeeBps !== undefined && config.maxNetworkFeeBps !== null && networkFees.length === 0) {
+      throw new OrchestraStateError('Source network fee is required to enforce maxNetworkFeeBps.', {
+        feeType: 'network',
+        maxFeeBps: String(config.maxNetworkFeeBps)
+      })
+    }
     this._enforceFeeLimit(
-      fees.filter(fee => fee.type === 'network').reduce((total, fee) => total + fee.amount, 0n),
+      networkFees.reduce((total, fee) => total + fee.amount, 0n),
       inputAmount,
       config.maxNetworkFeeBps,
       'network'
@@ -677,9 +741,11 @@ export default class Orchestra extends SwidgeProtocol {
     const sourceHash = order.sourceTxHash ?? order.txHash ?? order.depositTxHash ?? status.sourceTxHash
     const destinationHash = order.destinationTxHash ?? order.payoutTxHash ?? order.withdrawTxHash ?? status.destinationTxHash
     const refundHash = order.refundTxHash ?? status.refundTxHash
-    if (sourceHash) transactions.push({ hash: sourceHash, chain: options.fromChain, type: 'source' })
-    if (destinationHash) transactions.push({ hash: destinationHash, chain: options.toChain, type: 'destination' })
-    if (refundHash) transactions.push({ hash: refundHash, chain: options.fromChain, type: 'refund' })
+    const sourceChain = options.fromChain ?? order.sourceChain
+    const destinationChain = options.toChain ?? order.destinationChain
+    if (sourceHash) transactions.push({ hash: sourceHash, ...optionalObject('chain', sourceChain), type: 'source' })
+    if (destinationHash) transactions.push({ hash: destinationHash, ...optionalObject('chain', destinationChain), type: 'destination' })
+    if (refundHash) transactions.push({ hash: refundHash, ...optionalObject('chain', sourceChain), type: 'refund' })
     return transactions
   }
 
@@ -837,7 +903,7 @@ export default class Orchestra extends SwidgeProtocol {
     const sourceTxHash = readTransferHash(result, 'Bitcoin sendTransaction')
     return {
       sourceTxHash,
-      sourceNetworkFee: result.fee ?? 0n,
+      sourceNetworkFee: result.fee,
       sourceAddress
     }
   }
@@ -852,7 +918,7 @@ export default class Orchestra extends SwidgeProtocol {
         to: intent.depositAddress,
         value: BigInt(intent.amountIn)
       })
-      return { sourceTxHash: readTransferHash(result, 'Spark sendTransaction'), sourceNetworkFee: result.fee ?? 0n, sourceAddress }
+      return { sourceTxHash: readTransferHash(result, 'Spark sendTransaction'), sourceNetworkFee: result.fee, sourceAddress }
     }
 
     if (typeof this._account.transfer !== 'function') {
@@ -869,7 +935,7 @@ export default class Orchestra extends SwidgeProtocol {
       recipient: intent.depositAddress,
       amount: BigInt(intent.amountIn)
     })
-    return { sourceTxHash: readTransferHash(result, 'Spark transfer'), sourceNetworkFee: result.fee ?? 0n, sourceAddress }
+    return { sourceTxHash: readTransferHash(result, 'Spark transfer'), sourceNetworkFee: result.fee, sourceAddress }
   }
 
   async _sendAccountPayment (intent, options) {
@@ -882,7 +948,7 @@ export default class Orchestra extends SwidgeProtocol {
         to: intent.depositAddress,
         value: BigInt(intent.amountIn)
       })
-      return { sourceTxHash: readTransferHash(result, `${intent.sourceChain} sendTransaction`), sourceNetworkFee: result.fee ?? 0n, sourceAddress }
+      return { sourceTxHash: readTransferHash(result, `${intent.sourceChain} sendTransaction`), sourceNetworkFee: result.fee, sourceAddress }
     }
 
     if (typeof this._account.transfer !== 'function') {
@@ -901,7 +967,7 @@ export default class Orchestra extends SwidgeProtocol {
       recipient: intent.depositAddress,
       amount: BigInt(intent.amountIn)
     })
-    return { sourceTxHash: readTransferHash(result, `${intent.sourceChain} transfer`), sourceNetworkFee: result.fee ?? 0n, sourceAddress }
+    return { sourceTxHash: readTransferHash(result, `${intent.sourceChain} transfer`), sourceNetworkFee: result.fee, sourceAddress }
   }
 
   async _submitTransfer (intent, sourceTxHash, options) {
@@ -912,13 +978,17 @@ export default class Orchestra extends SwidgeProtocol {
 
   async _submitBody (intent, sourceTxHash, options) {
     if (intent.sourceChain === 'spark') {
+      const sourceSparkAddress = options.sourceSparkAddress ??
+        options.sourceAddress ??
+        intent.sourceAddress ??
+        await this._account?.getAddress?.()
+      if (!sourceSparkAddress) {
+        throw new OrchestraStateError('Spark submit requires sourceSparkAddress, sourceAddress, intent.sourceAddress, or an account with getAddress().')
+      }
       return {
         quoteId: intent.quoteId,
         sparkTxHash: sourceTxHash,
-        sourceSparkAddress: options.sourceSparkAddress ??
-          options.sourceAddress ??
-          intent.sourceAddress ??
-          await this._account.getAddress()
+        sourceSparkAddress
       }
     }
     if (intent.sourceChain === 'bitcoin') {
@@ -1073,6 +1143,11 @@ export default class Orchestra extends SwidgeProtocol {
  * @property {'exact_in' | 'exact_out'} amountMode
  * @property {string} amountIn
  * @property {string} estimatedOut
+ * @property {string} [minAmountOut]
+ * @property {string} [minimumOut]
+ * @property {string} [minOut]
+ * @property {string} [guaranteedOut]
+ * @property {number} [slippageBps]
  * @property {string} depositAddress
  * @property {string} expiresAt
  * @property {string} [sourceTokenAddress]

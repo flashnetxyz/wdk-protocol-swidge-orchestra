@@ -78,6 +78,13 @@ function retryDelayMs (attempt, baseDelayMs, response) {
   return exponential + Math.floor(Math.random() * Math.min(100, exponential))
 }
 
+function retryCount (value, field) {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${field} must be a non-negative integer.`)
+  }
+  return value
+}
+
 export function isTerminalOrderStatus (status) {
   return status === 'completed' ||
     status === 'failed' ||
@@ -93,9 +100,9 @@ export class OrchestraClient {
     this._fetch = config.fetch ?? globalThis.fetch
     this._getAuthHeaders = config.getAuthHeaders
     this._timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS
-    this._maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES
+    this._maxRetries = retryCount(config.maxRetries ?? DEFAULT_MAX_RETRIES, 'maxRetries')
     this._retryDelayMs = config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS
-    this._submitMaxRetries = config.submitMaxRetries ?? Math.max(this._maxRetries, 6)
+    this._submitMaxRetries = retryCount(config.submitMaxRetries ?? Math.max(this._maxRetries, 6), 'submitMaxRetries')
     this._submitRetryDelayMs = config.submitRetryDelayMs ?? this._retryDelayMs
     this._sseToken = config.sseToken
     this._getSseToken = config.getSseToken
@@ -153,7 +160,7 @@ export class OrchestraClient {
       ...options,
       signal: controller.signal,
       close
-    }).catch(err => {
+    }).then(close, err => {
       if (!closed) callbacks.onError?.(err)
       close()
     })
@@ -163,16 +170,20 @@ export class OrchestraClient {
 
   async _runSse (orderId, callbacks, options) {
     const token = await this._resolveSseToken()
-    const query = { token }
+    const query = {}
     if (options.readToken) query.readToken = options.readToken
     const url = `${this._baseUrl}/v1/sse/operations/${encodeURIComponent(orderId)}${makeQuery(query)}`
+    const headers = await this._headers(options)
+    headers.Authorization = `Bearer ${token}`
+    headers.Accept = 'text/event-stream'
     const response = await this._fetch(url, {
       method: 'GET',
-      headers: { Accept: 'text/event-stream' },
+      headers,
       signal: options.signal
     })
 
-    if (!response.ok || !response.body) {
+    const contentType = (response.headers.get('content-type') ?? '').toLowerCase()
+    if (!response.ok || !response.body || !contentType.includes('text/event-stream')) {
       throw new OrchestraApiError('sse_connection_failed', `SSE connection failed: HTTP ${response.status}`, response.status)
     }
 
@@ -185,12 +196,15 @@ export class OrchestraClient {
     try {
       while (!options.signal.aborted) {
         const { done, value } = await reader.read()
-        if (done) return
+        if (done) {
+          throw new OrchestraApiError('sse_connection_closed', 'SSE connection closed before a terminal order status.', 0)
+        }
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split('\n')
         buffer = lines.pop() ?? ''
 
-        for (const line of lines) {
+        for (const rawLine of lines) {
+          const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
           if (line.startsWith('event:')) event = line.slice(6).trim()
           else if (line.startsWith('data:')) data += `${data ? '\n' : ''}${line.slice(5).trim()}`
           else if (line === '') {
@@ -199,6 +213,7 @@ export class OrchestraClient {
               callbacks.onStatus?.(parsed.status, parsed)
               if (isTerminalOrderStatus(parsed.status)) {
                 options.close()
+                await reader.cancel()
                 return
               }
             }
@@ -214,7 +229,7 @@ export class OrchestraClient {
 
   async _requestJson (method, path, options = {}) {
     let lastError
-    const maxRetries = options.maxRetries ?? this._maxRetries
+    const maxRetries = retryCount(options.maxRetries ?? this._maxRetries, 'maxRetries')
     const retryDelay = options.retryDelayMs ?? this._retryDelayMs
     const retryErrorCodes = options.retryErrorCodes ?? new Set()
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
@@ -271,10 +286,10 @@ export class OrchestraClient {
         0
       )
     }
-    if (this._authMode !== 'client') {
+    if (this._authMode !== 'client' && this._authMode !== 'auto') {
       throw new OrchestraApiError(
         'sse_token_required',
-        "SSE requires sseToken/getSseToken unless authMode is explicitly set to 'client'.",
+        "SSE requires sseToken/getSseToken unless authMode is explicitly set to 'client' or 'auto'.",
         0
       )
     }

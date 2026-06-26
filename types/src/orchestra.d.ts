@@ -161,6 +161,11 @@ export interface OrchestraSwapIntent {
   amountMode: 'exact_in' | 'exact_out'
   amountIn: string
   estimatedOut: string
+  minAmountOut?: string
+  minimumOut?: string
+  minOut?: string
+  guaranteedOut?: string
+  slippageBps?: number
   depositAddress: string
   feeAmount?: string
   totalFeeAmount?: string

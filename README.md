@@ -1,8 +1,8 @@
-# @flashnet/orchestra-wdk
+# wdk-protocol-swidge-orchestra
 
 ![Powered by WDK](https://img.shields.io/badge/Powered%20by-WDK-111111)
 
-`@flashnet/orchestra-wdk` is a WDK `SwidgeProtocol` for moving between BTC on Spark, Bitcoin L1, or Lightning and USDT on Ethereum, Tron, Arbitrum, Solana, BSC, Optimism, Plasma, Polygon, TON, and every route returned by Orchestra.
+`wdk-protocol-swidge-orchestra` is a WDK `SwidgeProtocol` for moving between BTC on Spark or Bitcoin L1 and USDT on Ethereum, Tron, Arbitrum, Solana, BSC, Optimism, Plasma, Polygon, TON, and every WDK-executable route returned by Orchestra. It also supports destination Lightning payments where Orchestra routes exist.
 
 WDK owns wallet accounts, key material, and transaction signing. Orchestra owns quote routing, deposit addresses, order state, and settlement. The host wallet owns durable local or backend persistence.
 
@@ -28,7 +28,7 @@ Representative BTC and USDT routes:
 const routes = [
   "spark:BTC -> tron:USDT",
   "bitcoin:BTC -> ethereum:USDT",
-  "lightning:BTC -> arbitrum:USDT",
+  "arbitrum:USDT -> spark:BTC",
   "bsc:USDT -> spark:BTC",
   "solana:USDT -> lightning:BTC",
   "polygon:USDT -> bitcoin:BTC"
@@ -45,23 +45,23 @@ const tokens = await orchestra.getSupportedTokens({
 })
 ```
 
-Use discovery for wallet UI. Use the route matrix when you need the exact source and destination pairs Orchestra can execute at that moment.
+Use discovery for wallet UI. Use the route matrix when you need the exact source and destination pairs Orchestra can execute at that moment. For this package's standard WDK execution flow, do not expose source Lightning routes.
 
 ## Install
 
 ```bash
-npm install @flashnet/orchestra-wdk @tetherto/wdk-wallet@1.0.0-beta.9
+npm install wdk-protocol-swidge-orchestra @tetherto/wdk-wallet@1.0.0-beta.11
 ```
 
 Install the WDK wallet packages for the chains you support:
 
 ```bash
-npm install @tetherto/wdk @tetherto/wdk-wallet-spark @tetherto/wdk-wallet-btc @tetherto/wdk-wallet-evm
+npm install @tetherto/wdk@1.0.0-beta.12 @tetherto/wdk-wallet-spark@1.0.0-beta.21 @tetherto/wdk-wallet-btc@1.0.0-beta.10 @tetherto/wdk-wallet-evm@1.0.0-beta.14
 ```
 
 ## WDK Interface
 
-`Orchestra` extends `SwidgeProtocol` from `@tetherto/wdk-wallet@1.0.0-beta.9`.
+`Orchestra` extends `SwidgeProtocol` from `@tetherto/wdk-wallet@1.0.0-beta.11`.
 
 Implemented methods:
 
@@ -84,7 +84,7 @@ import WDK from "@tetherto/wdk"
 import WalletManagerBtc from "@tetherto/wdk-wallet-btc"
 import WalletManagerEvm from "@tetherto/wdk-wallet-evm"
 import WalletManagerSpark from "@tetherto/wdk-wallet-spark"
-import Orchestra from "@flashnet/orchestra-wdk"
+import Orchestra from "wdk-protocol-swidge-orchestra"
 
 const wdk = new WDK(seedPhrase)
   .registerWallet("spark", WalletManagerSpark, {
@@ -133,6 +133,8 @@ const orchestra = new Orchestra(arbitrum, {
 
 `quoteSwidge()` is side-effect-free. It calls Orchestra's estimate endpoint and does not reserve a deposit address.
 
+Treat the result as indicative UI data. It does not bind execution, lock a rate, or reserve the returned amounts, fees, or expiry. `swidge()` creates a fresh binding Orchestra quote through `prepareSwap()`, so wallet UIs should not assume a prior `quoteSwidge()` result is reused.
+
 ```javascript
 const quote = await orchestra.quoteSwidge({
   fromToken: "spark:BTC",
@@ -158,7 +160,7 @@ Use smallest units:
 
 ## Execute With WDK Swidge
 
-`swidge()` creates an Orchestra quote, sends the source payment from the WDK account, submits the transaction id to Orchestra, and returns the Orchestra order id.
+`swidge()` creates an Orchestra quote, sends the source payment from the WDK account to the quote deposit address, submits the transaction id to Orchestra, and returns the Orchestra order id.
 
 ```javascript
 const result = await orchestra.swidge({
@@ -176,7 +178,9 @@ console.log(result.hash)
 console.log(result.transactions)
 ```
 
-Use this one-call path only when the host app has its own crash recovery around the call. Wallet production flows should use the explicit persistence boundary below.
+There is a recovery gap after the source payment is sent and before Orchestra accepts the transaction id. If the app exits in that window, funds have moved but the order may not yet be linked to the source transaction.
+
+Use this one-call path only when the host app has recovery around the call. Production wallets should prefer `prepareSwap()` -> persist their own `saveSwap` state -> `executeSwapIntent()`. If they use `swidge()`, they should persist the state passed to every `onStateChange` callback and persist `OrchestraSubmitError.state` before retrying.
 
 ## Production Flow
 
@@ -324,7 +328,7 @@ Pass `recipient` for cross-account routes. A protocol constructed on a Spark acc
 
 ## Lightning
 
-Orchestra supports USDT-to-Lightning routes such as `bsc:USDT -> lightning:BTC` and `solana:USDT -> lightning:BTC`. A wallet can pay a BOLT11 invoice or Lightning Address using USDT from a supported chain.
+Orchestra supports destination Lightning routes such as `bsc:USDT -> lightning:BTC` and `solana:USDT -> lightning:BTC`. A wallet can pay a BOLT11 invoice or Lightning Address using USDT from a supported chain where the route exists.
 
 ```javascript
 const bsc = await wdk.getAccount("bsc", 0)
@@ -346,7 +350,7 @@ const intent = await orchestra.prepareSwap({
 
 Current API behavior: Orchestra asks for `refundAddress` on Lightning destinations. The package forwards `refundChain` and `refundAddress`; it does not enforce the rule locally. If Orchestra removes that API requirement, this package does not need a public API change.
 
-Lightning source routes, such as `lightning:BTC -> tron:USDT`, are also present in the route matrix. A Lightning source is not a WDK account send. The user pays an Orchestra Lightning receive invoice, then the app submits the receive request id to Orchestra.
+Lightning as a source is not supported through this package's standard `swidge()` or `executeSwapIntent()` flow. Those methods execute WDK account sends and submit source transaction ids. They do not implement an Orchestra receive-request-id path for a user-paid Lightning invoice.
 
 ## Auth
 
@@ -468,6 +472,18 @@ try {
   return await orchestra.resumeSwap(err.state)
 }
 ```
+
+## Error Types
+
+All package-specific errors extend `OrchestraError`.
+
+| Error | When it is thrown | Useful fields |
+| --- | --- | --- |
+| `OrchestraError` | Base class for package-specific failures. | `code`, `details` |
+| `OrchestraApiError` | Orchestra returns an API error or an invalid API response. | `code`, `status`, `details` |
+| `OrchestraStateError` | Input state is incomplete, unsafe to resume, expired, or not compatible with the requested source payment. | `code`, `details` |
+| `OrchestraSubmitError` | The source payment was sent, but submit, post-submit validation, or post-submit state persistence failed. Persist `state` before retrying. | `state`, `cause` |
+| `OrchestraTimeoutError` | An HTTP request or wait operation exceeds its timeout. | `code`, `details` |
 
 ## Status Mapping
 
@@ -617,9 +633,13 @@ npm run build:types
 npm pack --dry-run
 ```
 
+## Support
+
+For package support, reach out to info@flashnet.xyz.
+
 ## Security
 
-See [SECURITY.md](./SECURITY.md).
+Report vulnerabilities through [GitHub Security Advisories](https://github.com/flashnetxyz/wdk-protocol-swidge-orchestra/security/advisories/new). Do not open a public issue for a vulnerability. See [SECURITY.md](./SECURITY.md).
 
 ## License
 
