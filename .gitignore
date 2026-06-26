@@ -1,0 +1,12 @@
+node_modules/
+coverage/
+.DS_Store
+.env
+.env.*
+!.env.example
+!.env.*.example
+.orchestra-live.env
+.orchestra-live-state/
+bun.lock
+bun.lockb
+yarn.lock
