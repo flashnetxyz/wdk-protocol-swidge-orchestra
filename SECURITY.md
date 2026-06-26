@@ -1,6 +1,6 @@
 # Security
 
-Report vulnerabilities privately through [GitHub Security Advisories](https://github.com/flashnetxyz/orchestra-wdk/security/advisories/new) for this repository.
+Report vulnerabilities privately through [GitHub Security Advisories](https://github.com/flashnetxyz/wdk-protocol-swidge-orchestra/security/advisories/new) for this repository.
 
 Do not open a public issue for a vulnerability. Include the affected version, reproduction steps, impact, and any relevant logs with secrets removed.
 

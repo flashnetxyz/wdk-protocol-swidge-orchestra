@@ -639,7 +639,7 @@ For package support, reach out to info@flashnet.xyz.
 
 ## Security
 
-Report vulnerabilities through [GitHub Security Advisories](https://github.com/flashnetxyz/orchestra-wdk/security/advisories/new). Do not open a public issue for a vulnerability. See [SECURITY.md](./SECURITY.md).
+Report vulnerabilities through [GitHub Security Advisories](https://github.com/flashnetxyz/wdk-protocol-swidge-orchestra/security/advisories/new). Do not open a public issue for a vulnerability. See [SECURITY.md](./SECURITY.md).
 
 ## License
 

@@ -18,12 +18,12 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/flashnetxyz/orchestra-wdk.git"
+    "url": "git+https://github.com/flashnetxyz/wdk-protocol-swidge-orchestra.git"
   },
   "bugs": {
-    "url": "https://github.com/flashnetxyz/orchestra-wdk/issues"
+    "url": "https://github.com/flashnetxyz/wdk-protocol-swidge-orchestra/issues"
   },
-  "homepage": "https://github.com/flashnetxyz/orchestra-wdk#readme",
+  "homepage": "https://github.com/flashnetxyz/wdk-protocol-swidge-orchestra#readme",
   "main": "index.js",
   "type": "module",
   "types": "./types",
